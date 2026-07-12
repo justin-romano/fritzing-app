@@ -57,6 +57,10 @@ private:
 	// monolithic loop body. Nested so it can use the router's private
 	// helpers without widening the public surface.
 	struct NetRoutingPass;
+	// Same pattern for part placement: board topology, hole caches, planning
+	// state and rejection counters shared by the placement phases (movable
+	// part collection, rigid/bendable candidate search, commit, verify).
+	struct PlacementPass;
 
 	int clearPreviousAutorouteWires();
 	int autoplacePartsOnBreadboard();
@@ -102,6 +106,7 @@ private:
 	double routeScore(ConnectorItem * from, ConnectorItem * to) const;
 	int countUnresolvedNets() const;
 	void clearCollectedNets();
+	void sortCollectedNets();
 	void loadTuning();
 
 	// Wall-clock per pipeline phase, reset each start(); logged as one
