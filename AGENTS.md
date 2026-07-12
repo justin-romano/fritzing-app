@@ -309,3 +309,49 @@ sketch is INVISIBLE to the router (never in topology.holes()). This is the
 real root of "second board unused", deeper than scoring. Fix when doing
 board-spill: accept every owner with >= MinimumBreadboardHoleCount holes that
 isBreadboardItem, not just the largest.
+
+## Codeing Hints
+1. Refactor as you go. So you can keep the source base comprehendble 
+2. Reduce usage of elseif. where posible. Replace with smaller functions that return booleans.
+3. Make sure functions dont get too big. Refactor them into smaller functions. Only 7 operations per function is better.
+4. Use comments where code is highly abstract and maths heavy. So its clear whats going on.
+6. Use test first method, using the existing unit test framework where possible.
+7. Dont be a dumbass. The usual stuff. I will let *you* work that out.
+## Session update 2026-07-12 (evening) — commits fef10ba8, fd36112c
+
+DONE:
+- PlacementPass refactor: autoplacePartsOnBreadboard (~925 lines) -> 30-line driver + nested struct (same pattern as NetRoutingPass). Commit block = commitBest() is the Stage-3a plan/commit seam.
+- DETERMINISM: autoroute results used to vary per run (Qt per-process hash seed). Fixed: sortCollectedNets() (members by attachedToID+connectorSharedID; nets by smallest real part pin - key must ignore holes/wires because placement merges equal-potential groups), collectCandidateGroups emits by first-member appearance, collectRoutableSubnets sorts after collectEqualPotential.
+- OWNERSHIP RE-SEED: net indices double as bus-owner keys but nets are re-collected after placement (293->250 on stress, groups merge). seedBusOwnership() + audit baseline now re-run after the re-collect. Without this, sorted collections misalign keys -> mass net failures.
+- MULTI-BOARD: topology accepts every whitelisted board >= MinimumBreadboardHoleCount (stable id order; fallback = largest owner). Placement pulls to NEAREST board centroid (per-board hole means, accumulated in sorted order = bitwise no-op on 1 board); candidates must keep all holes on one board (rigid + bendable).
+- PROGRESS: percent model (placement 0-70, routing 70-95, 100 at end), per-part/per-net message2, reportProgress() with 200ms-gated ProcessEventBlocker pump.
+
+BASELINES (deterministic now):
+- fuzz.fzz: 0 failed / 5 jumpers / 338.079 / 251.235 (x3 identical; old 320.078 was one lucky draw of the old nondeterminism)
+- stress.fzz 2 boards: 0 failed / leads 590.384 (was 766.761 on 1 board), jumpers 9-11 (SEE OPEN #1)
+
+OPEN:
+1. Twin-board routing tie variance: stress jumpers 9 vs 11 across runs, placements bit-identical. Suspect bus-id assignment order (busGroupFor memo first-visit) feeding route-graph edge tie-breaks, possibly via pointer-keyed hash iteration in audit baseline recording. Diff artifacts/multiboard/stress1 vs stress2 route lines for first divergence.
+2. placeSearch 105s on 2 boards (was 24s) - O(holes^2) bendable scan. Stage-2 spatial grid is THE next task.
+3. GUI smoke harness: window/desktop capture broken on multi-monitor (shot VS Code, not Fritzing). Modal completion dialog BLOCKS final log flush -> -WatchLog times out on failing sketches. Planned fix (not applied): PostMessage WM_CLOSE to non-main process windows during Wait-AutorouteComplete + in Close action.
+4. USER REPRO WANTED: part (trimpot?) with "legs cut off" floating off-board with ratsnests (user screenshot, origin unknown). Need %TEMP% log from that exact run before it is overwritten. Possible undo/flip leg-restore interaction.
+5. Dialog fatigue: user wants a way out of modal-dialog-blocked screens (harness-side; see #3).
+
+## HANDOFF (2026-07-12, Claude -> Codex): start here
+
+STATE: develop @ fd36112c, tree clean (untracked only: .vscode/ AGENTS.md artifacts/ experiments/). Remote `fork` = github.com/justin-romano/fritzing-app — after every commit push BOTH `develop:develop` and `develop:breadboard-autorouter`. origin = upstream fritzing/fritzing-app (fetch only, no push rights).
+
+BUILD (gotchas are real, they cost a past session 5 false measurements):
+- MUST run from repo root: cmd /c build-msvc64\copilot-build-release.bat
+- ALWAYS verify release64\Fritzing.exe LastWriteTime after building.
+- A running Fritzing locks the exe -> LNK1104. Kill it first.
+TESTS: build-msvc64\run-breadboard-tests.bat + run-route-graph-tests.bat (Boost, 15 cases / 68 assertions, all green).
+ACCEPTANCE (deterministic — exact equality expected): fuzz.fzz = 0 failed / 5 jumpers / 338.079 / 251.235. stress.fzz (2 boards) = 0 failed / leads 590.384 / jumpers 9-11 (the 9-vs-11 variance is OPEN #1 above, everything else must match). Harness invocation examples in "Session update 2026-07-12" + GUI smoke section; beware OPEN #3 harness bugs.
+
+PRIORITY QUEUE:
+1. Stage-2 spatial grid over hole positions (placeSearch 105s on stress; plan file: C:\Users\Administrator\.claude\plans\now-im-going-full-pure-lemur.md, Stage 1 "no over-scanning" + Stage 2). Kernels land test-first (Boost) per plan.
+2. OPEN #1 twin-board routing tie variance (diff artifacts/multiboard/stress1 vs stress2, first divergent "route choose/bridge" line).
+3. OPEN #3 harness WM_CLOSE dialog dismissal + multi-monitor capture.
+4. OPEN #4 cut-legs repro — BLOCKED on user log; ask Justin.
+
+WORKING WITH JUSTIN: he steers, hands-on, pastes screenshots — never block him with interactive question tools, ask in plain English and wait. Commits go straight to develop. Visual/UI judgements are HIS, not yours. Keep answers concise. He tunes weights via the toolbar sliders (QSettings breadboardAutorouter/*, logged as "tuning:" — always check that line before comparing scores).
