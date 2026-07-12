@@ -356,9 +356,11 @@ void BreadboardAutorouter::start()
 				 .arg(undoIndexBefore));
 	undoStack->beginMacro(QObject::tr("Breadboard autoroute"));
 
+	invalidateRoutingCaches();
 	phaseTimer.restart();
 	const int cleared = clearPreviousAutorouteWires();
 	m_phaseStats.clearMs = takePhaseMs();
+	invalidateRoutingCaches();
 	if (cleared > 0)
 	{
 		logAutoroute(QString("clear complete: removedWires=%1").arg(cleared));
@@ -454,6 +456,8 @@ void BreadboardAutorouter::start()
 	phaseTimer.restart();
 	undoStack->push(parentCommand);
 	m_phaseStats.routeExecMs = takePhaseMs();
+	// Pushed commands created wires: the cached wire-ends list is stale.
+	invalidateRoutingCaches();
 
 	// The net-level planner minimizes jumpers, but Fritzing's ratsnest model is
 	// the authoritative completion check. Route only demands that remain after
@@ -469,6 +473,7 @@ void BreadboardAutorouter::start()
 			new CleanUpRatsnestsCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, completionCommand);
 			new CleanUpWiresCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, completionCommand);
 			undoStack->push(completionCommand);
+			invalidateRoutingCaches();
 			created += completed;
 		}
 		else
@@ -2194,18 +2199,11 @@ QList<QList<ConnectorItem *>> BreadboardAutorouter::collectCandidateGroups(const
 		}
 	}
 
-	Q_FOREACH (QGraphicsItem *graphicsItem, m_sketchWidget->scene()->items())
+	using WireEnds = QPair<ConnectorItem *, ConnectorItem *>;
+	Q_FOREACH (const WireEnds &wireEnds, normalBreadboardWireEnds())
 	{
-		auto *wire = dynamic_cast<Wire *>(graphicsItem);
-		if (wire == nullptr || wire->getRatsnest() || !wire->getNormal())
-			continue;
-		if (wire->viewID() != ViewLayer::BreadboardView)
-			continue;
-
-		ConnectorItem *from = routingConnectorFor(wire->connector0());
-		ConnectorItem *to = routingConnectorFor(wire->connector1());
-		if (from == nullptr || to == nullptr)
-			continue;
+		ConnectorItem *from = wireEnds.first;
+		ConnectorItem *to = wireEnds.second;
 
 		for (int first = 0; first < validCandidates.count(); first++)
 		{
@@ -2275,7 +2273,64 @@ bool BreadboardAutorouter::isTargetBreadboardHole(ConnectorItem *connectorItem) 
 
 bool BreadboardAutorouter::connectorsShareBreadboardBus(ConnectorItem *first, ConnectorItem *second) const
 {
-	return BreadboardTopology::connectorsShareBus(first, second);
+	if (first == nullptr || second == nullptr)
+		return false;
+	if (first == second)
+		return true;
+	return busGroupFor(first) == busGroupFor(second);
+}
+
+int BreadboardAutorouter::busGroupFor(ConnectorItem *connectorItem) const
+{
+	auto found = m_busGroupForConnector.constFind(connectorItem);
+	if (found != m_busGroupForConnector.constEnd())
+		return found.value();
+
+	const int groupId = m_busGroupCount++;
+	m_busGroupForConnector.insert(connectorItem, groupId);
+	ItemBase *item = connectorItem->attachedTo();
+	QList<ConnectorItem *> busSiblings;
+	if (item != nullptr && item->busConnectorItems(connectorItem, busSiblings))
+	{
+		Q_FOREACH (ConnectorItem *sibling, busSiblings)
+		{
+			if (sibling != nullptr && !m_busGroupForConnector.contains(sibling))
+				m_busGroupForConnector.insert(sibling, groupId);
+		}
+	}
+	return groupId;
+}
+
+const QList<QPair<ConnectorItem *, ConnectorItem *> > &BreadboardAutorouter::normalBreadboardWireEnds() const
+{
+	if (m_wireEndsCacheValid)
+		return m_normalBreadboardWireEnds;
+
+	m_normalBreadboardWireEnds.clear();
+	Q_FOREACH (QGraphicsItem *graphicsItem, m_sketchWidget->scene()->items())
+	{
+		auto *wire = dynamic_cast<Wire *>(graphicsItem);
+		if (wire == nullptr || wire->getRatsnest() || !wire->getNormal())
+			continue;
+		if (wire->viewID() != ViewLayer::BreadboardView)
+			continue;
+
+		ConnectorItem *from = routingConnectorFor(wire->connector0());
+		ConnectorItem *to = routingConnectorFor(wire->connector1());
+		if (from == nullptr || to == nullptr)
+			continue;
+		m_normalBreadboardWireEnds.append(qMakePair(from, to));
+	}
+	m_wireEndsCacheValid = true;
+	return m_normalBreadboardWireEnds;
+}
+
+void BreadboardAutorouter::invalidateRoutingCaches()
+{
+	m_wireEndsCacheValid = false;
+	m_normalBreadboardWireEnds.clear();
+	m_busGroupForConnector.clear();
+	m_busGroupCount = 0;
 }
 
 QString BreadboardAutorouter::connectorSummary(ConnectorItem *connectorItem) const

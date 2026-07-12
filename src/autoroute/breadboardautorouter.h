@@ -22,7 +22,9 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 #define BREADBOARDAUTOROUTER_H
 
 #include <QObject>
+#include <QHash>
 #include <QList>
+#include <QPair>
 #include <QStringList>
 
 #include "../viewgeometry.h"
@@ -62,6 +64,9 @@ private:
 	bool isPlaceablePin(ConnectorItem * connectorItem) const;
 	bool isTargetBreadboardHole(ConnectorItem * connectorItem) const;
 	bool connectorsShareBreadboardBus(ConnectorItem * first, ConnectorItem * second) const;
+	int busGroupFor(ConnectorItem * connectorItem) const;
+	const QList<QPair<ConnectorItem *, ConnectorItem *> > & normalBreadboardWireEnds() const;
+	void invalidateRoutingCaches();
 	QString connectorSummary(ConnectorItem * connectorItem) const;
 	QString itemSummary(ItemBase * itemBase) const;
 	QString logFilePath() const;
@@ -106,6 +111,16 @@ private:
 	// Placement tuning weights, read from QSettings at every start() so the
 	// toolbar sliders take effect without restarting. Defaults live here.
 	PhaseStats m_phaseStats;
+
+	// Per-run memoization: bus membership never changes during an autoroute,
+	// and BreadboardTopology::connectorsShareBus rebuilds bus lists per call
+	// (dominant cost of route search pre-Stage-1). Cleared in start() and
+	// whenever pushed commands change scene wires.
+	mutable QHash<ConnectorItem *, int> m_busGroupForConnector;
+	mutable int m_busGroupCount = 0;
+	mutable bool m_wireEndsCacheValid = false;
+	mutable QList<QPair<ConnectorItem *, ConnectorItem *> > m_normalBreadboardWireEnds;
+
 	double m_maxLegLength = 120.0;
 	double m_leadLengthWeight = 1.0;
 	double m_jumperPenalty = 100000.0;
