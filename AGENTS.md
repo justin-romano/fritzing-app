@@ -131,6 +131,12 @@ ROOT CAUSE FOUND (routeSearch): BreadboardRouteGraph's constructor (breadboardro
 
 KEY FINDING: routeSearch dominates (79%/85%) — routing SEARCH, not command execution (51/196ms). Stage 4 (routing) promoted onto the critical path; profile inside routeCollectedNets next (suspects: collectCandidateGroups O(n^2) bus pairing per net, routingCandidatesForSubnet re-walks). Unit tests: repo uses Boost.Test (tests/auto/test_breadboard_routing_score); new pure kernels land test-first, GUI smoke only for end-to-end acceptance.
 
+## LSM303C failed-nets root cause (2026-07-12, log: artifacts/stage4e/stress)
+
+All 6 residual ratsnests on stress.fzz belong to the LSM303C breakout, and the cause is policy, not routing: its connectors are FEMALE header sockets, so BreadboardPartPolicy sees "pins=0 -> class=Ignore" (the log even shows topology briefly considering it a board: "topology owner candidate: holes=10 owner=LSM303C"). Its nets therefore never enter peripheral wiring. Double exclusion: routeCollectedNets' off-board terminal collection also skips female connectors explicitly. The SCP1000 (male pins, class=Peripheral pins=7) wired fine.
+
+Fix design: (1) BreadboardPartPolicy - a non-breadboard part with only female pins classifies as Peripheral, not Ignore; (2) peripheral terminal collection accepts female connectors on peripheral parts (jumpering into a female header is physically standard). Guard: must not reclassify actual breadboards - the policy check runs on parts the topology did NOT accept as boards.
+
 ## Unresolved Work
 
 1. Reduce board jumpers without breaking connectivity. Optimize in strict priority order:
