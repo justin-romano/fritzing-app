@@ -110,6 +110,20 @@ namespace
 		return QLineF(from->sceneAdjustedTerminalPoint(nullptr), to->sceneAdjustedTerminalPoint(nullptr));
 	}
 
+	// A female connector only counts as a breadboard hole when its owner IS
+	// a breadboard. Breakout boards (LSM303C etc.) have female header
+	// sockets too; treating those as holes turned them into phantom board
+	// anchors that routing could never reach.
+	bool isBreadboardHoleConnector(ConnectorItem *connectorItem)
+	{
+		if (connectorItem == nullptr || connectorItem->connectorType() != Connector::Female)
+			return false;
+		ItemBase *owner = connectorItem->attachedTo();
+		if (owner == nullptr)
+			return false;
+		return BreadboardTopology::isBreadboardItem(owner->layerKinChief());
+	}
+
 	BreadboardRouteGraphCore::Options coreRouteOptions()
 	{
 		const BreadboardRouteGraph::Options env = BreadboardRouteGraph::Options::fromEnvironment();
@@ -2084,8 +2098,11 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				continue;
 			}
 
+			// Female sockets on peripheral parts (breakout headers) are
+			// legitimate jumper terminals; only breadboard holes are excluded
+			// (they became anchors above via connectedBreadboardHoleFor).
 			BreadboardPartPolicy::Decision policy = BreadboardPartPolicy::classify(itemBase->layerKinChief());
-			if (policy.classification == BreadboardPartPolicy::Classification::Peripheral && connectorItem->connectorType() != Connector::Female && !offBoardTerminals.contains(connectorItem))
+			if (policy.classification == BreadboardPartPolicy::Classification::Peripheral && !offBoardTerminals.contains(connectorItem))
 			{
 				offBoardTerminals.append(connectorItem);
 				logAutoroute(QString("route peripheral terminal: net=%1 terminal=%2 class=%3 reason=%4")
@@ -2918,7 +2935,7 @@ ConnectorItem *BreadboardAutorouter::connectedBreadboardHoleFor(ConnectorItem *p
 	if (partConnector == nullptr)
 		return nullptr;
 	if (partConnector->connectorType() == Connector::Female)
-		return partConnector;
+		return isBreadboardHoleConnector(partConnector) ? partConnector : nullptr;
 
 	Q_FOREACH (ConnectorItem *connectorItem, partConnector->connectedToItems())
 	{
@@ -2933,7 +2950,7 @@ ConnectorItem *BreadboardAutorouter::connectedBreadboardHoleFor(ConnectorItem *p
 			continue;
 		if (connectorItem->attachedToItemType() == ModelPart::Wire)
 			continue;
-		if (connectorItem->connectorType() == Connector::Female)
+		if (isBreadboardHoleConnector(connectorItem))
 			return connectorItem;
 	}
 
@@ -2945,7 +2962,7 @@ ConnectorItem *BreadboardAutorouter::breadboardHoleFor(ConnectorItem *partConnec
 	if (partConnector == nullptr)
 		return nullptr;
 	if (partConnector->connectorType() == Connector::Female)
-		return partConnector;
+		return isBreadboardHoleConnector(partConnector) ? partConnector : nullptr;
 
 	Q_FOREACH (ConnectorItem *connectorItem, partConnector->connectedToItems())
 	{
@@ -2960,7 +2977,7 @@ ConnectorItem *BreadboardAutorouter::breadboardHoleFor(ConnectorItem *partConnec
 			continue;
 		if (connectorItem->attachedToItemType() == ModelPart::Wire)
 			continue;
-		if (connectorItem->connectorType() != Connector::Female)
+		if (!isBreadboardHoleConnector(connectorItem))
 			continue;
 
 		if (connectorItem->connectionsCount() == 0)

@@ -281,3 +281,31 @@ Rollback RE-ENABLED: any real short ends the macro, undoes, and reports. fuzz
 PRIME INVARIANT now holds by construction AND is independently audited. Remaining
 open items unchanged: LSM303C female-pin policy (6 residuals), board-spill onto
 2nd board, placement spatial grid (~24s), then Stage 2 threading.
+
+## LSM303C / female-socket breakouts FIXED (2026-07-12, Opus 4.8) - stress.fzz routes COMPLETE
+
+Three coordinated fixes:
+1. isBreadboardHoleConnector() (autorouter, file-local): a female connector only
+   counts as a breadboard hole when its owner layerKinChief isBreadboardItem.
+   breadboardHoleFor/connectedBreadboardHoleFor now use it - previously ANY
+   female pin returned as itself, so breakout sockets became phantom board
+   anchors that routing could never reach (the 6 LSM303C failures).
+2. BreadboardPartPolicy: placeablePins==0 but femaleSockets>0 -> Peripheral
+   ("female-socket breakout (jumper wiring only)") instead of Ignore. Applies
+   uniformly to all breakouts per user rule; future exception reserved for
+   dual-row male headers at breadboard pitch (those have placeable pins and
+   never reach this branch).
+3. Terminal collection in routeCollectedNets: female sockets of Peripheral
+   parts are legitimate off-board jumper terminals (breadboard holes still
+   become anchors, not terminals).
+
+RESULT stress.fzz: 19 placed, 26 wires, 11 jumpers, failedNets=0, conformance
+verified (0 shorts). fuzz regression clean. Placement (23.9s) is now the only
+remaining cost - Stage 1 grid next.
+
+ALSO DISCOVERED (open): BreadboardTopology::discover only accepts ONE board
+when nothing is selected (single bestOwner) - the second breadboard on a
+sketch is INVISIBLE to the router (never in topology.holes()). This is the
+real root of "second board unused", deeper than scoring. Fix when doing
+board-spill: accept every owner with >= MinimumBreadboardHoleCount holes that
+isBreadboardItem, not just the largest.
