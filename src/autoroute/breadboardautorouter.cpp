@@ -1983,98 +1983,123 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 	return created;
 }
 
-int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
+// One net-routing pass over the sketch. The pass owns the state every phase
+// shares (route graph session, reserved holes, planned wire segments, score
+// counters); routeCollectedNets() is reduced to building the pass and driving
+// nets through its phases in most-constrained-first order.
+struct BreadboardAutorouter::NetRoutingPass
 {
+	BreadboardAutorouter *self = nullptr;
+	QUndoCommand *parentCommand = nullptr;
+
+	QList<ConnectorItem *> routeHoles;
+	QSet<ConnectorItem *> reservedHoles;
+	HoleBounds holeBounds;
+	RouteGraphSession session;
+	QList<QLineF> plannedSegments;
+	QSet<int> failedNetIndices;
 	int created = 0;
 	int wiredPeripheral = 0;
 	int allocatedPeripheralLanes = 0;
 	double peripheralLeadLength = 0.0;
 
-	BreadboardTopology topology;
-	topology.discover(m_sketchWidget->scene(), m_sketchWidget->scene()->selectedItems());
-	QList<ConnectorItem *> routeHoles = topology.holes();
-	QSet<ConnectorItem *> routeReservedHoles = topology.reservedHoles();
-	const HoleBounds routeHoleBounds = boundsForHoles(routeHoles);
-	QList<QLineF> plannedSegments;
-	QSet<int> failedNetIndices;
-	const RouteGraphSession netRouteSession = RouteGraphSession::build(
-		routeHoles,
-		[this](ConnectorItem *connectorItem) { return busGroupFor(connectorItem); },
-		[this](int busGroup) { return busOwner(busGroup); });
-	const BreadboardRouteGraph::Options activeOptions = BreadboardRouteGraph::Options::fromEnvironment();
-	logAutoroute(QString("route options: maxJumperLength=%1 candidatesPerBusPair=%2 crossingPenalty=%3 overlapPenalty=%4")
-				 .arg(activeOptions.maxJumperLength)
-				 .arg(activeOptions.candidatesPerBusPair)
-				 .arg(activeOptions.crossingPenalty)
-				 .arg(activeOptions.overlapPenalty));
+	// Working data for the net currently being routed.
+	int netIndex = -1;
+	QList<ConnectorItem *> breadboardAnchors;
+	QList<ConnectorItem *> offBoardTerminals;
+	QList<QList<ConnectorItem *> > groups;
 
-	QList<int> routeOrder;
-	for (int netIndex = 0; netIndex < m_allPartConnectorItems.count(); netIndex++)
+	NetRoutingPass(BreadboardAutorouter *router, QUndoCommand *command)
+		: self(router)
+		, parentCommand(command)
 	{
-		routeOrder.append(netIndex);
+		BreadboardTopology topology;
+		topology.discover(self->m_sketchWidget->scene(), self->m_sketchWidget->scene()->selectedItems());
+		routeHoles = topology.holes();
+		reservedHoles = topology.reservedHoles();
+		holeBounds = boundsForHoles(routeHoles);
+		session = RouteGraphSession::build(
+			routeHoles,
+			[this](ConnectorItem *connectorItem) { return self->busGroupFor(connectorItem); },
+			[this](int busGroup) { return self->busOwner(busGroup); });
+
+		const BreadboardRouteGraph::Options activeOptions = BreadboardRouteGraph::Options::fromEnvironment();
+		self->logAutoroute(QString("route options: maxJumperLength=%1 candidatesPerBusPair=%2 crossingPenalty=%3 overlapPenalty=%4")
+						   .arg(activeOptions.maxJumperLength)
+						   .arg(activeOptions.candidatesPerBusPair)
+						   .arg(activeOptions.crossingPenalty)
+						   .arg(activeOptions.overlapPenalty));
 	}
-	// Precompute each net's difficulty once: the sort comparator would
-	// otherwise re-run subnet grouping O(n log n) times.
-	QHash<int, double> difficultyForNet;
-	Q_FOREACH (int netIndex, routeOrder)
+
+	// Wire a lead from an off-board terminal to a board hole, with all the
+	// bookkeeping a peripheral lead requires (lead-length accounting so it
+	// is not counted as a board jumper, reservation, bus claim).
+	void addPeripheralLead(ConnectorItem *terminal, ConnectorItem *entry)
 	{
-		QList<ConnectorItem *> *net = m_allPartConnectorItems.value(netIndex);
-		if (net == nullptr)
-		{
-			difficultyForNet.insert(netIndex, 0.0);
-			continue;
-		}
-		const QList<ConnectorItem *> candidates = routingCandidatesForSubnet(*net);
-		const int groups = collectCandidateGroups(candidates).count();
-		QRectF bounds;
-		Q_FOREACH (ConnectorItem *candidate, candidates) {
-			if (candidate == nullptr) continue;
-			const QRectF point(candidate->sceneAdjustedTerminalPoint(nullptr), QSizeF(1.0, 1.0));
-			bounds = bounds.isNull() ? point : bounds | point;
-		}
-		difficultyForNet.insert(netIndex, groups * 100000.0 + candidates.count() * 1000.0 + bounds.width() + bounds.height());
+		self->m_sketchWidget->createWire(terminal, entry, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
+		const QLineF lead = connectorLine(terminal, entry);
+		plannedSegments.append(lead);
+		peripheralLeadLength += lead.length();
+		reservedHoles.insert(entry);
+		self->claimBus(self->busGroupFor(entry), netIndex);
+		created++;
+		wiredPeripheral++;
 	}
-	std::sort(routeOrder.begin(), routeOrder.end(), [&difficultyForNet](int firstIndex, int secondIndex) {
-		return difficultyForNet.value(firstIndex) > difficultyForNet.value(secondIndex);
-	});
-	QStringList routeOrderText;
-	Q_FOREACH (int netIndex, routeOrder) routeOrderText.append(QString::number(netIndex));
-	logAutoroute(QString("route order (most constrained first): %1").arg(routeOrderText.join(",")));
 
-	for (int orderIndex = 0; orderIndex < routeOrder.count(); orderIndex++)
+	// Wire one board jumper segment produced by the route graph, claiming
+	// both end buses for the net (prime invariant bookkeeping).
+	void addGraphWire(const BreadboardRouteGraph::Segment &segment)
 	{
-		Q_EMIT setProgressValue(orderIndex);
-		const int i = routeOrder.at(orderIndex);
+		self->m_sketchWidget->createWire(segment.from, segment.to, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
+		plannedSegments.append(connectorLine(segment.from, segment.to));
+		reservedHoles.insert(segment.from);
+		reservedHoles.insert(segment.to);
+		self->claimBus(self->busGroupFor(segment.from), netIndex);
+		self->claimBus(self->busGroupFor(segment.to), netIndex);
+		created++;
+	}
 
-		QList<ConnectorItem *> *net = m_allPartConnectorItems.at(i);
-		if (net == nullptr)
-			continue;
+	// Route nets hardest-first so constrained nets grab scarce buses before
+	// easy nets consume them. Difficulty is precomputed: the comparator
+	// would otherwise re-run subnet grouping O(n log n) times.
+	QList<int> netOrderMostConstrainedFirst() const
+	{
+		QList<int> routeOrder;
+		for (int index = 0; index < self->m_allPartConnectorItems.count(); index++)
+			routeOrder.append(index);
 
-		QList<ConnectorItem *> candidates = routingCandidatesForSubnet(*net);
-		QList<QList<ConnectorItem *>> groups = collectCandidateGroups(candidates);
-		logAutoroute(QString("route net %1: netConnectors=%2 candidates=%3 groups=%4")
-						 .arg(i)
-						 .arg(net->count())
-						 .arg(candidates.count())
-						 .arg(groups.count()));
-		for (int groupIndex = 0; groupIndex < groups.count(); groupIndex++)
+		QHash<int, double> difficultyForNet;
+		Q_FOREACH (int index, routeOrder)
 		{
-			QStringList connectorLines;
-			QList<ConnectorItem *> group = groups.at(groupIndex);
-			for (int connectorIndex = 0; connectorIndex < group.count() && connectorIndex < 6; connectorIndex++)
+			QList<ConnectorItem *> *net = self->m_allPartConnectorItems.value(index);
+			if (net == nullptr)
 			{
-				connectorLines.append(connectorSummary(group.at(connectorIndex)));
+				difficultyForNet.insert(index, 0.0);
+				continue;
 			}
-			logAutoroute(QString("route net %1 group %2 size=%3 sample=[%4]")
-							 .arg(i)
-							 .arg(groupIndex)
-							 .arg(group.count())
-							 .arg(connectorLines.join(" | ")));
+			const QList<ConnectorItem *> candidates = self->routingCandidatesForSubnet(*net);
+			const int groupCount = self->collectCandidateGroups(candidates).count();
+			QRectF bounds;
+			Q_FOREACH (ConnectorItem *candidate, candidates) {
+				if (candidate == nullptr) continue;
+				const QRectF point(candidate->sceneAdjustedTerminalPoint(nullptr), QSizeF(1.0, 1.0));
+				bounds = bounds.isNull() ? point : bounds | point;
+			}
+			difficultyForNet.insert(index, groupCount * 100000.0 + candidates.count() * 1000.0 + bounds.width() + bounds.height());
 		}
+		std::sort(routeOrder.begin(), routeOrder.end(), [&difficultyForNet](int firstIndex, int secondIndex) {
+			return difficultyForNet.value(firstIndex) > difficultyForNet.value(secondIndex);
+		});
+		return routeOrder;
+	}
 
-		QList<ConnectorItem *> breadboardAnchors;
-		QList<ConnectorItem *> offBoardTerminals;
-		Q_FOREACH (ConnectorItem *connectorItem, *net)
+	// Split the net's connectors into breadboard anchors (pins already in
+	// holes) and off-board peripheral terminals that need jumper leads.
+	void collectTerminals(const QList<ConnectorItem *> &net)
+	{
+		breadboardAnchors.clear();
+		offBoardTerminals.clear();
+		Q_FOREACH (ConnectorItem *connectorItem, net)
 		{
 			if (connectorItem == nullptr)
 				continue;
@@ -2087,10 +2112,10 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				continue;
 			if (connectorItem->attachedToItemType() == ModelPart::Wire)
 				continue;
-			if (!isPlaceablePin(connectorItem) && connectorItem->connectorType() != Connector::Female)
+			if (!self->isPlaceablePin(connectorItem) && connectorItem->connectorType() != Connector::Female)
 				continue;
 
-			ConnectorItem *connectedHole = connectedBreadboardHoleFor(connectorItem);
+			ConnectorItem *connectedHole = self->connectedBreadboardHoleFor(connectorItem);
 			if (connectedHole != nullptr)
 			{
 				if (!breadboardAnchors.contains(connectedHole))
@@ -2105,258 +2130,253 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 			if (policy.classification == BreadboardPartPolicy::Classification::Peripheral && !offBoardTerminals.contains(connectorItem))
 			{
 				offBoardTerminals.append(connectorItem);
-				logAutoroute(QString("route peripheral terminal: net=%1 terminal=%2 class=%3 reason=%4")
-								 .arg(i)
-								 .arg(connectorSummary(connectorItem))
-								 .arg(BreadboardPartPolicy::classificationName(policy.classification))
-								 .arg(policy.reason));
+				self->logAutoroute(QString("route peripheral terminal: net=%1 terminal=%2 class=%3 reason=%4")
+								   .arg(netIndex)
+								   .arg(self->connectorSummary(connectorItem))
+								   .arg(BreadboardPartPolicy::classificationName(policy.classification))
+								   .arg(policy.reason));
 			}
 			else if (policy.classification == BreadboardPartPolicy::Classification::BoardPlaceable && connectorItem->connectorType() != Connector::Female)
 			{
-				logAutoroute(QString("route skip board-placeable offboard terminal: net=%1 terminal=%2 reason=not a peripheral")
-								 .arg(i)
-								 .arg(connectorSummary(connectorItem)));
+				self->logAutoroute(QString("route skip board-placeable offboard terminal: net=%1 terminal=%2 reason=not a peripheral")
+								   .arg(netIndex)
+								   .arg(self->connectorSummary(connectorItem)));
 			}
 		}
+	}
 
-		if (breadboardAnchors.isEmpty() && offBoardTerminals.count() > 1)
+	// A net with NO board presence yet (all terminals off-board, e.g. a pot
+	// wired straight to a jack) gets a "lane": one board entry hole per
+	// terminal, chosen near the board edge facing it, plus graph routes
+	// joining those entries into one electrical group. All-or-nothing: the
+	// lane is only wired when every terminal found an entry and every entry
+	// pair found a route.
+	void wirePeripheralLane()
+	{
+		if (!breadboardAnchors.isEmpty() || offBoardTerminals.count() <= 1)
+			return;
+
+		QList<ConnectorItem *> terminalEntries;
+		QSet<ConnectorItem *> usedEntries;
+		QList<QLineF> entryLeadSegments = plannedSegments;
+		bool entriesReady = true;
+
+		Q_FOREACH (ConnectorItem *terminal, offBoardTerminals)
 		{
-			QList<ConnectorItem *> terminalEntries;
-			QSet<ConnectorItem *> usedEntries;
-			QList<QLineF> entryLeadSegments = plannedSegments;
-			bool entriesReady = true;
-
-			Q_FOREACH (ConnectorItem *terminal, offBoardTerminals)
+			ConnectorItem *bestEntry = nullptr;
+			double bestEntryScore = std::numeric_limits<double>::max();
+			Q_FOREACH (ConnectorItem *entry, routeHoles)
 			{
-				ConnectorItem *bestEntry = nullptr;
-				double bestEntryScore = std::numeric_limits<double>::max();
-				Q_FOREACH (ConnectorItem *entry, routeHoles)
+				if (entry == nullptr || reservedHoles.contains(entry) || usedEntries.contains(entry))
+					continue;
+				if (entry->connectionsCount() > 0)
+					continue;
+				if (!self->busAvailableFor(self->busGroupFor(entry), netIndex))
+					continue;
+				const double score = boardEdgeEntryScore(terminal, entry, holeBounds)
+				                   + leadCongestionPenalty(terminal, entry, entryLeadSegments);
+				if (score < bestEntryScore)
 				{
-					if (entry == nullptr || routeReservedHoles.contains(entry) || usedEntries.contains(entry))
+					bestEntry = entry;
+					bestEntryScore = score;
+				}
+			}
+			if (bestEntry == nullptr)
+			{
+				entriesReady = false;
+				failedNetIndices.insert(netIndex);
+				self->logAutoroute(QString("route peripheral entry skipped: net=%1 terminal=%2 no free edge entry")
+								   .arg(netIndex)
+								   .arg(self->connectorSummary(terminal)));
+				break;
+			}
+			terminalEntries.append(bestEntry);
+			usedEntries.insert(bestEntry);
+			entryLeadSegments.append(connectorLine(terminal, bestEntry));
+			self->logAutoroute(QString("route peripheral entry: net=%1 terminal=%2 entry=%3 score=%4")
+							   .arg(netIndex)
+							   .arg(self->connectorSummary(terminal))
+							   .arg(self->connectorSummary(bestEntry))
+							   .arg(bestEntryScore));
+		}
+
+		QList<BreadboardRouteGraph::Result> entryRoutes;
+		if (entriesReady)
+		{
+			QSet<ConnectorItem *> temporaryReserved = reservedHoles;
+			QList<QLineF> entryPlanningSegments = plannedSegments;
+			Q_FOREACH (ConnectorItem *entry, terminalEntries)
+			{
+				temporaryReserved.insert(entry);
+			}
+
+			QList<ConnectorItem *> connectedEntries;
+			if (!terminalEntries.isEmpty())
+				connectedEntries.append(terminalEntries.first());
+
+			for (int targetIndex = 1; targetIndex < terminalEntries.count(); targetIndex++)
+			{
+				ConnectorItem *targetEntry = terminalEntries.at(targetIndex);
+				BreadboardRouteGraph::Result bestRoute;
+				const BreadboardRouteGraphCore::QueryContext entryContext = session.prepare(temporaryReserved, entryPlanningSegments, netIndex);
+				Q_FOREACH (ConnectorItem *connectedEntry, connectedEntries)
+				{
+					BreadboardRouteGraph::Result route = session.route(connectedEntry, targetEntry, entryContext);
+					if (!route.found)
 						continue;
-					if (entry->connectionsCount() > 0)
-						continue;
-					if (!busAvailableFor(busGroupFor(entry), i))
-						continue;
-					const double score = boardEdgeEntryScore(terminal, entry, routeHoleBounds)
-					                   + leadCongestionPenalty(terminal, entry, entryLeadSegments);
-					if (score < bestEntryScore)
+					if (routeIsBetter(route, bestRoute))
 					{
-						bestEntry = entry;
-						bestEntryScore = score;
+						bestRoute = route;
 					}
 				}
-				if (bestEntry == nullptr)
+				if (!bestRoute.found)
 				{
 					entriesReady = false;
-					failedNetIndices.insert(i);
-					logAutoroute(QString("route peripheral entry skipped: net=%1 terminal=%2 no free edge entry")
-									 .arg(i)
-									 .arg(connectorSummary(terminal)));
+					failedNetIndices.insert(netIndex);
+					self->logAutoroute(QString("route peripheral entries skipped: net=%1 entry=%2 no graph route")
+									   .arg(netIndex)
+									   .arg(self->connectorSummary(targetEntry)));
 					break;
 				}
-				terminalEntries.append(bestEntry);
-				usedEntries.insert(bestEntry);
-				entryLeadSegments.append(connectorLine(terminal, bestEntry));
-				logAutoroute(QString("route peripheral entry: net=%1 terminal=%2 entry=%3 score=%4")
-								 .arg(i)
-								 .arg(connectorSummary(terminal))
-								 .arg(connectorSummary(bestEntry))
-								 .arg(bestEntryScore));
-			}
-
-			QList<BreadboardRouteGraph::Result> entryRoutes;
-			if (entriesReady)
-			{
-				QSet<ConnectorItem *> temporaryReserved = routeReservedHoles;
-				QList<QLineF> entryPlanningSegments = plannedSegments;
-				Q_FOREACH (ConnectorItem *entry, terminalEntries)
-				{
-					temporaryReserved.insert(entry);
+				entryRoutes.append(bestRoute);
+				Q_FOREACH (const BreadboardRouteGraph::Segment &segment, bestRoute.segments) {
+					entryPlanningSegments.append(connectorLine(segment.from, segment.to));
+					temporaryReserved.insert(segment.from);
+					temporaryReserved.insert(segment.to);
 				}
-
-				QList<ConnectorItem *> connectedEntries;
-				if (!terminalEntries.isEmpty())
-					connectedEntries.append(terminalEntries.first());
-
-				for (int targetIndex = 1; targetIndex < terminalEntries.count(); targetIndex++)
-				{
-					ConnectorItem *targetEntry = terminalEntries.at(targetIndex);
-					BreadboardRouteGraph::Result bestRoute;
-					const BreadboardRouteGraphCore::QueryContext entryContext = netRouteSession.prepare(temporaryReserved, entryPlanningSegments, i);
-					Q_FOREACH (ConnectorItem *connectedEntry, connectedEntries)
-					{
-						BreadboardRouteGraph::Result route = netRouteSession.route(connectedEntry, targetEntry, entryContext);
-						if (!route.found)
-							continue;
-						if (routeIsBetter(route, bestRoute))
-						{
-							bestRoute = route;
-						}
-					}
-					if (!bestRoute.found)
-					{
-						entriesReady = false;
-						failedNetIndices.insert(i);
-						logAutoroute(QString("route peripheral entries skipped: net=%1 entry=%2 no graph route")
-										 .arg(i)
-										 .arg(connectorSummary(targetEntry)));
-						break;
-					}
-					entryRoutes.append(bestRoute);
-					Q_FOREACH (const BreadboardRouteGraph::Segment &segment, bestRoute.segments) {
-						entryPlanningSegments.append(connectorLine(segment.from, segment.to));
-						temporaryReserved.insert(segment.from);
-						temporaryReserved.insert(segment.to);
-					}
-					connectedEntries.append(targetEntry);
-				}
-			}
-
-			if (entriesReady && terminalEntries.count() == offBoardTerminals.count())
-			{
-				allocatedPeripheralLanes++;
-				logAutoroute(QString("route peripheral entries: net=%1 terminals=%2 routes=%3")
-								 .arg(i)
-								 .arg(offBoardTerminals.count())
-								 .arg(entryRoutes.count()));
-				for (int terminalIndex = 0; terminalIndex < offBoardTerminals.count(); terminalIndex++)
-				{
-					ConnectorItem *terminal = offBoardTerminals.at(terminalIndex);
-					ConnectorItem *target = terminalEntries.at(terminalIndex);
-					if (terminal == nullptr || target == nullptr)
-						continue;
-					m_sketchWidget->createWire(terminal, target, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
-					const QLineF peripheralLead = connectorLine(terminal, target);
-					plannedSegments.append(peripheralLead);
-					peripheralLeadLength += peripheralLead.length();
-					routeReservedHoles.insert(target);
-					claimBus(busGroupFor(target), i);
-					created++;
-					wiredPeripheral++;
-				}
-				Q_FOREACH (const BreadboardRouteGraph::Result &route, entryRoutes)
-				{
-					Q_FOREACH (const BreadboardRouteGraph::Segment &segment, route.segments)
-					{
-						if (segment.from == nullptr || segment.to == nullptr || segment.from == segment.to)
-							continue;
-						m_sketchWidget->createWire(segment.from, segment.to, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
-						plannedSegments.append(connectorLine(segment.from, segment.to));
-						routeReservedHoles.insert(segment.from);
-						routeReservedHoles.insert(segment.to);
-						claimBus(busGroupFor(segment.from), i);
-						claimBus(busGroupFor(segment.to), i);
-						created++;
-					}
-				}
-				breadboardAnchors.append(terminalEntries.first());
-				offBoardTerminals.clear();
+				connectedEntries.append(targetEntry);
 			}
 		}
 
-		if (!breadboardAnchors.isEmpty() && !offBoardTerminals.isEmpty())
+		if (entriesReady && terminalEntries.count() == offBoardTerminals.count())
 		{
-			QSet<ConnectorItem *> usedBridgeTargets;
-			Q_FOREACH (ConnectorItem *terminal, offBoardTerminals)
+			allocatedPeripheralLanes++;
+			self->logAutoroute(QString("route peripheral entries: net=%1 terminals=%2 routes=%3")
+							   .arg(netIndex)
+							   .arg(offBoardTerminals.count())
+							   .arg(entryRoutes.count()));
+			for (int terminalIndex = 0; terminalIndex < offBoardTerminals.count(); terminalIndex++)
 			{
-				ConnectorItem *bestAnchor = nullptr;
-				ConnectorItem *bestEntry = nullptr;
-				BreadboardRouteGraph::Result bestRoute;
-				BreadboardRoutingScore bestBridgeScore;
-				bool haveBridgeScore = false;
-				const BreadboardRouteGraphCore::QueryContext bridgeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments, i);
-				// One Dijkstra per anchor; each of the ~holes entries below
-				// is then a constant-time extract instead of its own search.
-				QList<BreadboardRouteGraphCore::MultiResult> anchorRoutes;
-				Q_FOREACH (ConnectorItem *anchor, breadboardAnchors)
-					anchorRoutes.append(netRouteSession.routeFrom(anchor, bridgeContext));
-
-				Q_FOREACH (ConnectorItem *entry, routeHoles)
-				{
-					if (entry == nullptr || routeReservedHoles.contains(entry) || usedBridgeTargets.contains(entry))
-						continue;
-					if (entry->connectionsCount() > 0)
-						continue;
-					if (!busAvailableFor(busGroupFor(entry), i))
-						continue;
-					const double entryScore = boardEdgeEntryScore(terminal, entry, routeHoleBounds)
-					                        + leadCongestionPenalty(terminal, entry, plannedSegments);
-					if (entryScore == std::numeric_limits<double>::max())
-						continue;
-
-					for (int anchorIndex = 0; anchorIndex < breadboardAnchors.count(); anchorIndex++)
-					{
-						ConnectorItem *anchor = breadboardAnchors.at(anchorIndex);
-						if (anchor == nullptr)
-							continue;
-						BreadboardRouteGraph::Result route = netRouteSession.extract(anchorRoutes.at(anchorIndex), entry);
-						if (!route.found)
-							continue;
-
-						BreadboardRoutingScore score = route.score;
-						score.jumperCount++;
-						score.jumperLength += connectorLine(terminal, entry).length();
-						score.congestion += entryScore;
-						if (!haveBridgeScore || score < bestBridgeScore)
-						{
-							bestAnchor = anchor;
-							bestEntry = entry;
-							bestRoute = route;
-							bestBridgeScore = score;
-							haveBridgeScore = true;
-						}
-					}
-				}
-
-				if (bestEntry == nullptr || !bestRoute.found)
-				{
-					failedNetIndices.insert(i);
-					logAutoroute(QString("route bridge skipped: net=%1 terminal=%2 no breadboard target")
-									 .arg(i)
-									 .arg(connectorSummary(terminal)));
+				ConnectorItem *terminal = offBoardTerminals.at(terminalIndex);
+				ConnectorItem *target = terminalEntries.at(terminalIndex);
+				if (terminal == nullptr || target == nullptr)
 					continue;
-				}
-
-				logAutoroute(QString("route bridge: net=%1 terminal=%2 anchor=%3 entry=%4 segments=%5 score=%6")
-								 .arg(i)
-								 .arg(connectorSummary(terminal))
-								 .arg(connectorSummary(bestAnchor))
-								 .arg(connectorSummary(bestEntry))
-								 .arg(bestRoute.segments.count())
-							 .arg(bestBridgeScore.toString()));
-				m_sketchWidget->createWire(terminal, bestEntry, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
-				const QLineF peripheralLead = connectorLine(terminal, bestEntry);
-				plannedSegments.append(peripheralLead);
-				peripheralLeadLength += peripheralLead.length();
-				usedBridgeTargets.insert(bestEntry);
-				routeReservedHoles.insert(bestEntry);
-				claimBus(busGroupFor(bestEntry), i);
-				created++;
-				wiredPeripheral++;
-
-				Q_FOREACH (const BreadboardRouteGraph::Segment &segment, bestRoute.segments)
+				addPeripheralLead(terminal, target);
+			}
+			Q_FOREACH (const BreadboardRouteGraph::Result &route, entryRoutes)
+			{
+				Q_FOREACH (const BreadboardRouteGraph::Segment &segment, route.segments)
 				{
 					if (segment.from == nullptr || segment.to == nullptr || segment.from == segment.to)
 						continue;
-					m_sketchWidget->createWire(segment.from, segment.to, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
-					plannedSegments.append(connectorLine(segment.from, segment.to));
-					routeReservedHoles.insert(segment.from);
-					routeReservedHoles.insert(segment.to);
-					claimBus(busGroupFor(segment.from), i);
-					claimBus(busGroupFor(segment.to), i);
-					logAutoroute(QString("route bridge graph wire: net=%1 from=%2 to=%3 cost=%4")
-									 .arg(i)
-									 .arg(connectorSummary(segment.from))
-									 .arg(connectorSummary(segment.to))
-									 .arg(segment.cost));
-					created++;
+					addGraphWire(segment);
 				}
 			}
+			breadboardAnchors.append(terminalEntries.first());
+			offBoardTerminals.clear();
 		}
+	}
 
+	// Bridge each remaining off-board terminal to the net's existing board
+	// presence: pick the (entry hole, anchor) pair with the best combined
+	// lead + graph-route score, wire the lead, then wire the route.
+	void bridgeTerminalsToAnchors()
+	{
+		if (breadboardAnchors.isEmpty() || offBoardTerminals.isEmpty())
+			return;
+
+		QSet<ConnectorItem *> usedBridgeTargets;
+		Q_FOREACH (ConnectorItem *terminal, offBoardTerminals)
+		{
+			ConnectorItem *bestAnchor = nullptr;
+			ConnectorItem *bestEntry = nullptr;
+			BreadboardRouteGraph::Result bestRoute;
+			BreadboardRoutingScore bestBridgeScore;
+			bool haveBridgeScore = false;
+			const BreadboardRouteGraphCore::QueryContext bridgeContext = session.prepare(reservedHoles, plannedSegments, netIndex);
+			// One Dijkstra per anchor; each of the ~holes entries below is
+			// then a constant-time extract instead of its own search.
+			QList<BreadboardRouteGraphCore::MultiResult> anchorRoutes;
+			Q_FOREACH (ConnectorItem *anchor, breadboardAnchors)
+				anchorRoutes.append(session.routeFrom(anchor, bridgeContext));
+
+			Q_FOREACH (ConnectorItem *entry, routeHoles)
+			{
+				if (entry == nullptr || reservedHoles.contains(entry) || usedBridgeTargets.contains(entry))
+					continue;
+				if (entry->connectionsCount() > 0)
+					continue;
+				if (!self->busAvailableFor(self->busGroupFor(entry), netIndex))
+					continue;
+				const double entryScore = boardEdgeEntryScore(terminal, entry, holeBounds)
+				                        + leadCongestionPenalty(terminal, entry, plannedSegments);
+				if (entryScore == std::numeric_limits<double>::max())
+					continue;
+
+				for (int anchorIndex = 0; anchorIndex < breadboardAnchors.count(); anchorIndex++)
+				{
+					ConnectorItem *anchor = breadboardAnchors.at(anchorIndex);
+					if (anchor == nullptr)
+						continue;
+					BreadboardRouteGraph::Result route = session.extract(anchorRoutes.at(anchorIndex), entry);
+					if (!route.found)
+						continue;
+
+					BreadboardRoutingScore score = route.score;
+					score.jumperCount++;
+					score.jumperLength += connectorLine(terminal, entry).length();
+					score.congestion += entryScore;
+					if (!haveBridgeScore || score < bestBridgeScore)
+					{
+						bestAnchor = anchor;
+						bestEntry = entry;
+						bestRoute = route;
+						bestBridgeScore = score;
+						haveBridgeScore = true;
+					}
+				}
+			}
+
+			if (bestEntry == nullptr || !bestRoute.found)
+			{
+				failedNetIndices.insert(netIndex);
+				self->logAutoroute(QString("route bridge skipped: net=%1 terminal=%2 no breadboard target")
+								   .arg(netIndex)
+								   .arg(self->connectorSummary(terminal)));
+				continue;
+			}
+
+			self->logAutoroute(QString("route bridge: net=%1 terminal=%2 anchor=%3 entry=%4 segments=%5 score=%6")
+							   .arg(netIndex)
+							   .arg(self->connectorSummary(terminal))
+							   .arg(self->connectorSummary(bestAnchor))
+							   .arg(self->connectorSummary(bestEntry))
+							   .arg(bestRoute.segments.count())
+							   .arg(bestBridgeScore.toString()));
+			addPeripheralLead(terminal, bestEntry);
+			usedBridgeTargets.insert(bestEntry);
+
+			Q_FOREACH (const BreadboardRouteGraph::Segment &segment, bestRoute.segments)
+			{
+				if (segment.from == nullptr || segment.to == nullptr || segment.from == segment.to)
+					continue;
+				addGraphWire(segment);
+				self->logAutoroute(QString("route bridge graph wire: net=%1 from=%2 to=%3 cost=%4")
+								   .arg(netIndex)
+								   .arg(self->connectorSummary(segment.from))
+								   .arg(self->connectorSummary(segment.to))
+								   .arg(segment.cost));
+			}
+		}
+	}
+
+	// Merge the net's electrically separate groups with graph-routed
+	// jumpers, always joining the cheapest available pair first, until one
+	// group remains or no legal route exists.
+	void mergeSubnetGroups()
+	{
 		if (groups.count() < 2)
-			continue;
+			return;
 
 		while (groups.count() > 1)
 		{
@@ -2366,7 +2386,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 			BreadboardRoutingScore bestRoutingScore;
 			double bestTieBreak = std::numeric_limits<double>::max();
 			bool haveBestScore = false;
-			const BreadboardRouteGraphCore::QueryContext mergeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments, i);
+			const BreadboardRouteGraphCore::QueryContext mergeContext = session.prepare(reservedHoles, plannedSegments, netIndex);
 
 			for (int fromSubnet = 0; fromSubnet < groups.count(); fromSubnet++)
 			{
@@ -2386,10 +2406,10 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 						{
 							if (fromCandidate == nullptr || toCandidate == nullptr || fromCandidate == toCandidate)
 								continue;
-							BreadboardRouteGraph::Result route = netRouteSession.route(fromCandidate, toCandidate, mergeContext);
+							BreadboardRouteGraph::Result route = session.route(fromCandidate, toCandidate, mergeContext);
 							if (!route.found)
 								continue;
-							const double tieBreak = routeScore(fromCandidate, toCandidate);
+							const double tieBreak = self->routeScore(fromCandidate, toCandidate);
 							if (!haveBestScore || route.score < bestRoutingScore
 							    || (route.score == bestRoutingScore && tieBreak < bestTieBreak))
 							{
@@ -2407,37 +2427,31 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 
 			if (!bestRoute.found)
 			{
-				failedNetIndices.insert(i);
-				logAutoroute(QString("route graph failed: net=%1 groups=%2 buses=%3 edges=%4")
-								 .arg(i)
-								 .arg(groups.count())
-								 .arg(netRouteSession.core->busCount())
-								 .arg(netRouteSession.core->edgeCount()));
-				break;
+				failedNetIndices.insert(netIndex);
+				self->logAutoroute(QString("route graph failed: net=%1 groups=%2 buses=%3 edges=%4")
+								   .arg(netIndex)
+								   .arg(groups.count())
+								   .arg(session.core->busCount())
+								   .arg(session.core->edgeCount()));
+				return;
 			}
 
-			logAutoroute(QString("route choose: net=%1 fromGroup=%2 toGroup=%3 segments=%4 score=%5")
-							 .arg(i)
-							 .arg(bestFromSubnet)
-							 .arg(bestToSubnet)
-							 .arg(bestRoute.segments.count())
-							 .arg(bestRoutingScore.toString()));
+			self->logAutoroute(QString("route choose: net=%1 fromGroup=%2 toGroup=%3 segments=%4 score=%5")
+							   .arg(netIndex)
+							   .arg(bestFromSubnet)
+							   .arg(bestToSubnet)
+							   .arg(bestRoute.segments.count())
+							   .arg(bestRoutingScore.toString()));
 			Q_FOREACH (const BreadboardRouteGraph::Segment &segment, bestRoute.segments)
 			{
 				if (segment.from == nullptr || segment.to == nullptr || segment.from == segment.to)
 					continue;
-				m_sketchWidget->createWire(segment.from, segment.to, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
-				plannedSegments.append(connectorLine(segment.from, segment.to));
-				routeReservedHoles.insert(segment.from);
-				routeReservedHoles.insert(segment.to);
-				claimBus(busGroupFor(segment.from), i);
-				claimBus(busGroupFor(segment.to), i);
-				logAutoroute(QString("route graph wire: net=%1 from=%2 to=%3 cost=%4")
-								 .arg(i)
-								 .arg(connectorSummary(segment.from))
-								 .arg(connectorSummary(segment.to))
-								 .arg(segment.cost));
-				created++;
+				addGraphWire(segment);
+				self->logAutoroute(QString("route graph wire: net=%1 from=%2 to=%3 cost=%4")
+								   .arg(netIndex)
+								   .arg(self->connectorSummary(segment.from))
+								   .arg(self->connectorSummary(segment.to))
+								   .arg(segment.cost));
 			}
 
 			groups[bestFromSubnet].append(groups.at(bestToSubnet));
@@ -2445,21 +2459,78 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 		}
 	}
 
-	double jumperLength = 0.0;
-	Q_FOREACH (const QLineF &segment, plannedSegments) jumperLength += segment.length();
-	jumperLength = qMax(0.0, jumperLength - peripheralLeadLength);
-	m_lastRoutingScore.failedNets = failedNetIndices.count();
-	m_lastRoutingScore.jumperCount = created - wiredPeripheral;
-	m_lastRoutingScore.jumperLength = jumperLength;
-	m_lastRoutingScore.componentLeadLength = m_componentLeadLength;
-	logAutoroute(QString("route counters: totalWires=%1 boardJumpers=%2 wiredPeripheral=%3 peripheralLeadLength=%4 allocatedPeripheralLanes=%5 failedNets=%6")
-				 .arg(created)
-				 .arg(created - wiredPeripheral)
-				 .arg(wiredPeripheral)
-				 .arg(peripheralLeadLength)
-				 .arg(allocatedPeripheralLanes)
-				 .arg(failedNetIndices.count()));
-	return created;
+	// Route one net: log its electrical groups, split terminals into
+	// anchors and off-board peripherals, then run the three wiring phases.
+	void routeNet(int index, QList<ConnectorItem *> *net)
+	{
+		netIndex = index;
+		const QList<ConnectorItem *> candidates = self->routingCandidatesForSubnet(*net);
+		groups = self->collectCandidateGroups(candidates);
+		self->logAutoroute(QString("route net %1: netConnectors=%2 candidates=%3 groups=%4")
+						   .arg(netIndex)
+						   .arg(net->count())
+						   .arg(candidates.count())
+						   .arg(groups.count()));
+		for (int groupIndex = 0; groupIndex < groups.count(); groupIndex++)
+		{
+			QStringList connectorLines;
+			const QList<ConnectorItem *> group = groups.at(groupIndex);
+			for (int connectorIndex = 0; connectorIndex < group.count() && connectorIndex < 6; connectorIndex++)
+				connectorLines.append(self->connectorSummary(group.at(connectorIndex)));
+			self->logAutoroute(QString("route net %1 group %2 size=%3 sample=[%4]")
+							   .arg(netIndex)
+							   .arg(groupIndex)
+							   .arg(group.count())
+							   .arg(connectorLines.join(" | ")));
+		}
+
+		collectTerminals(*net);
+		wirePeripheralLane();
+		bridgeTerminalsToAnchors();
+		mergeSubnetGroups();
+	}
+
+	// Fill in the run's score and counters once every net is done.
+	void finish()
+	{
+		double jumperLength = 0.0;
+		Q_FOREACH (const QLineF &segment, plannedSegments) jumperLength += segment.length();
+		jumperLength = qMax(0.0, jumperLength - peripheralLeadLength);
+		self->m_lastRoutingScore.failedNets = failedNetIndices.count();
+		self->m_lastRoutingScore.jumperCount = created - wiredPeripheral;
+		self->m_lastRoutingScore.jumperLength = jumperLength;
+		self->m_lastRoutingScore.componentLeadLength = self->m_componentLeadLength;
+		self->logAutoroute(QString("route counters: totalWires=%1 boardJumpers=%2 wiredPeripheral=%3 peripheralLeadLength=%4 allocatedPeripheralLanes=%5 failedNets=%6")
+						   .arg(created)
+						   .arg(created - wiredPeripheral)
+						   .arg(wiredPeripheral)
+						   .arg(peripheralLeadLength)
+						   .arg(allocatedPeripheralLanes)
+						   .arg(failedNetIndices.count()));
+	}
+};
+
+int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
+{
+	NetRoutingPass pass(this, parentCommand);
+
+	const QList<int> routeOrder = pass.netOrderMostConstrainedFirst();
+	QStringList routeOrderText;
+	Q_FOREACH (int netIndex, routeOrder) routeOrderText.append(QString::number(netIndex));
+	logAutoroute(QString("route order (most constrained first): %1").arg(routeOrderText.join(",")));
+
+	for (int orderIndex = 0; orderIndex < routeOrder.count(); orderIndex++)
+	{
+		Q_EMIT setProgressValue(orderIndex);
+		const int netIndex = routeOrder.at(orderIndex);
+		QList<ConnectorItem *> *net = m_allPartConnectorItems.at(netIndex);
+		if (net == nullptr)
+			continue;
+		pass.routeNet(netIndex, net);
+	}
+
+	pass.finish();
+	return pass.created;
 }
 
 QList<QList<ConnectorItem *>> BreadboardAutorouter::collectCandidateGroups(const QList<ConnectorItem *> &candidates) const

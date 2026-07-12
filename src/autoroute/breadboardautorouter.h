@@ -52,6 +52,12 @@ Q_SIGNALS:
 	void setProgressMessage2(const QString &);
 
 private:
+	// Defined in the .cpp: carries the state shared across one net-routing
+	// pass so the per-net phases can live in named functions instead of one
+	// monolithic loop body. Nested so it can use the router's private
+	// helpers without widening the public surface.
+	struct NetRoutingPass;
+
 	int clearPreviousAutorouteWires();
 	int autoplacePartsOnBreadboard();
 	bool verifyPlacedConnections(const QHash<ConnectorItem *, ConnectorItem *> &placedTargets, QStringList &failures) const;
