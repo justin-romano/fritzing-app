@@ -30,6 +30,7 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 #include <QGraphicsScene>
 #include <QGraphicsItem>
 #include <QSet>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QtMath>
@@ -47,6 +48,34 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 
 namespace
 {
+	// How to swap the two pin positions of a part so crossed legs uncross
+	// while every net stays on its own pin. Mirroring keeps the body visually
+	// upright and is preferred when the part's fzp allows it; parts without
+	// flip support (e.g. resistors, which are axially symmetric anyway) fall
+	// back to a 180 degree rotation.
+	enum class PinSwap
+	{
+		None,
+		FlipHorizontal,
+		FlipVertical,
+		Rotate180
+	};
+
+	QPointF swappedPoint(const QPointF &point, PinSwap swap, const QPointF &center)
+	{
+		switch (swap)
+		{
+		case PinSwap::FlipHorizontal:
+			return QPointF(center.x() * 2.0 - point.x(), point.y());
+		case PinSwap::FlipVertical:
+			return QPointF(point.x(), center.y() * 2.0 - point.y());
+		case PinSwap::Rotate180:
+			return center * 2.0 - point;
+		default:
+			return point;
+		}
+	}
+
 	struct PlacementCandidate
 	{
 		ItemBase *item = nullptr;
@@ -56,12 +85,14 @@ namespace
 		QHash<ConnectorItem *, QPolygonF> pinToLeg;
 		double score = std::numeric_limits<double>::max();
 		bool usesLegPlacement = false;
+		PinSwap pinSwap = PinSwap::None;
 	};
+
+	constexpr double FlipRotationDegrees = 180.0;
 
 	constexpr double HoleMatchTolerance = 12.0;
 	constexpr double PlacementKeepoutMargin = 8.0;
 	constexpr double BendablePlacementKeepoutMargin = 1.0;
-	constexpr double MaxBendableLegLength = 120.0;
 
 	ViewGeometry::WireFlags generatedWireFlags()
 	{
@@ -190,25 +221,24 @@ namespace
 		return edgeDistance * 8.0 + perpendicularDistance + manhattanDistance(terminalPoint, entryPoint) * 0.1;
 	}
 
-	QPolygonF translatedLegForTarget(ConnectorItem *pin, const QPointF &offset, ConnectorItem *hole)
+	QPolygonF translatedLegForTarget(ConnectorItem *pin, const QPointF &offset, ConnectorItem *hole,
+									 PinSwap swap = PinSwap::None, const QPointF &swapCenter = QPointF())
 	{
 		QPolygonF translated;
 		if (pin == nullptr || hole == nullptr)
 			return translated;
 
+		// Do not preserve the leg's historical bend points: after the part
+		// moves they describe a stale shape, and snapping only the endpoint
+		// to the hole produces zigzag leads. Bend a fresh straight lead from
+		// the leg root at the body to the assigned hole instead.
 		QPolygonF oldLeg = pin->sceneAdjustedLeg();
-		if (oldLeg.count() < 2)
-		{
-			translated << pin->sceneAdjustedTerminalPoint(nullptr) + offset;
-			translated << hole->sceneAdjustedTerminalPoint(nullptr);
-			return translated;
-		}
-
-		Q_FOREACH (QPointF point, oldLeg)
-		{
-			translated << point + offset;
-		}
-		translated.replace(translated.count() - 1, hole->sceneAdjustedTerminalPoint(nullptr));
+		QPointF root = oldLeg.count() >= 2
+			? oldLeg.first()
+			: pin->sceneAdjustedTerminalPoint(nullptr);
+		root = swappedPoint(root, swap, swapCenter);
+		translated << root + offset;
+		translated << hole->sceneAdjustedTerminalPoint(nullptr);
 		return translated;
 	}
 
@@ -289,17 +319,28 @@ void BreadboardAutorouter::start()
 	QFile::remove(logFilePath());
 	logAutoroute("========== breadboard autoroute start ==========");
 	logAutoroute(QString("log file: %1").arg(logFilePath()));
+	loadTuning();
+	logAutoroute(QString("tuning: maxLegLength=%1 leadLengthWeight=%2 jumperPenalty=%3 leadAngleWeight=%4 foldbackWeight=%5")
+				 .arg(m_maxLegLength)
+				 .arg(m_leadLengthWeight)
+				 .arg(m_jumperPenalty)
+				 .arg(m_leadAngleWeight)
+				 .arg(m_foldbackWeight));
+
+	auto *undoStack = m_sketchWidget->undoStack();
+	const int undoCountBefore = undoStack->count();
+	const int undoIndexBefore = undoStack->index();
+	logAutoroute(QString("undo transaction begin: count=%1 index=%2")
+				 .arg(undoCountBefore)
+				 .arg(undoIndexBefore));
+	undoStack->beginMacro(QObject::tr("Breadboard autoroute"));
 
 	const int cleared = clearPreviousAutorouteWires();
 	if (cleared > 0)
 	{
-		Q_EMIT setMaximumProgress(1);
-		Q_EMIT setProgressValue(1);
-		Q_EMIT setProgressMessage(QObject::tr("Breadboard routes cleared."));
-		Q_EMIT setProgressMessage2(QObject::tr("Removed %1 generated breadboard wire(s).").arg(cleared));
 		logAutoroute(QString("clear complete: removedWires=%1").arg(cleared));
-		logAutoroute("========== breadboard autoroute end ==========");
-		return;
+		Q_EMIT setProgressMessage(QObject::tr("Cleared previous breadboard routes..."));
+		Q_EMIT setProgressMessage2(QObject::tr("Removed %1 generated breadboard wire(s).").arg(cleared));
 	}
 
 	clearCollectedNets();
@@ -310,6 +351,7 @@ void BreadboardAutorouter::start()
 
 	if (m_allPartConnectorItems.isEmpty())
 	{
+		undoStack->endMacro();
 		logAutoroute("abort: no breadboard connections to route");
 		QMessageBox::information(nullptr, QObject::tr("Fritzing"), QObject::tr("No breadboard connections to route."));
 		return;
@@ -320,18 +362,24 @@ void BreadboardAutorouter::start()
 	Q_EMIT setProgressMessage(QObject::tr("Placing breadboard parts..."));
 	Q_EMIT setProgressMessage2(QString());
 
-	auto *undoStack = m_sketchWidget->undoStack();
-	const int undoCountBefore = undoStack->count();
-	const int undoIndexBefore = undoStack->index();
-	logAutoroute(QString("undo transaction begin: count=%1 index=%2")
-				 .arg(undoCountBefore)
-				 .arg(undoIndexBefore));
-	undoStack->beginMacro(QObject::tr("Breadboard autoroute"));
 	int placed = autoplacePartsOnBreadboard();
 	logAutoroute(QString("undo transaction after placement: count=%1 index=%2")
 				 .arg(undoStack->count())
 				 .arg(undoStack->index()));
 	logAutoroute(QString("autoplace complete: placed=%1").arg(placed));
+	if (placed < 0)
+	{
+		clearCollectedNets();
+		undoStack->endMacro();
+		undoStack->undo();
+		logAutoroute("abort: placement connection verification failed; transaction rolled back");
+		QMessageBox messageBox(QMessageBox::Critical,
+							   QObject::tr("Fritzing"),
+							   QObject::tr("Breadboard placement produced detached component pins and was rolled back."));
+		messageBox.setDetailedText(m_lastPlacementReport);
+		messageBox.exec();
+		return;
+	}
 	if (placed > 0)
 	{
 		clearCollectedNets();
@@ -345,7 +393,7 @@ void BreadboardAutorouter::start()
 
 	auto *parentCommand = new QUndoCommand(QObject::tr("Route breadboard jumpers"));
 
-	int created = routeRatsnestDemands(parentCommand);
+	int created = routeCollectedNets(parentCommand);
 	logAutoroute(QString("route complete: createdWires=%1").arg(created));
 
 	Q_EMIT setProgressValue(m_allPartConnectorItems.count());
@@ -375,6 +423,32 @@ void BreadboardAutorouter::start()
 	new CleanUpRatsnestsCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, parentCommand);
 	new CleanUpWiresCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, parentCommand);
 	undoStack->push(parentCommand);
+
+	// The net-level planner minimizes jumpers, but Fritzing's ratsnest model is
+	// the authoritative completion check. Route only demands that remain after
+	// the optimized commands have executed; never report success over ratnests.
+	int residualRatsnests = countUnresolvedNets();
+	if (residualRatsnests > 0)
+	{
+		logAutoroute(QString("completion pass begin: residualRatsnests=%1").arg(residualRatsnests));
+		auto *completionCommand = new QUndoCommand(QObject::tr("Complete breadboard routes"));
+		const int completed = routeRatsnestDemands(completionCommand);
+		if (completed > 0)
+		{
+			new CleanUpRatsnestsCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, completionCommand);
+			new CleanUpWiresCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, completionCommand);
+			undoStack->push(completionCommand);
+			created += completed;
+		}
+		else
+		{
+			delete completionCommand;
+		}
+		residualRatsnests = countUnresolvedNets();
+		logAutoroute(QString("completion pass end: createdWires=%1 residualRatsnests=%2")
+					 .arg(completed)
+					 .arg(residualRatsnests));
+	}
 	logAutoroute(QString("undo transaction after routing: count=%1 index=%2")
 				 .arg(undoStack->count())
 				 .arg(undoStack->index()));
@@ -383,31 +457,111 @@ void BreadboardAutorouter::start()
 				 .arg(undoStack->count())
 				 .arg(undoStack->index())
 				 .arg(undoStack->count() - undoCountBefore));
-	m_lastRoutingScore.failedNets = countUnresolvedNets();
+	m_lastRoutingScore.failedNets = residualRatsnests;
 	logAutoroute(QString("benchmark: %1 elapsedMs=%2")
 				 .arg(m_lastRoutingScore.toString())
 				 .arg(elapsed.elapsed()));
 
-	Q_EMIT setProgressMessage2(QObject::tr("Placed %1 part(s), created %2 breadboard jumper wire(s).").arg(placed).arg(created));
-	logAutoroute(QString("success: placed=%1 createdWires=%2").arg(placed).arg(created));
+	if (residualRatsnests > 0)
+	{
+		Q_EMIT setProgressMessage2(QObject::tr("Routing incomplete: %1 connection(s) remain.").arg(residualRatsnests));
+		logAutoroute(QString("failure: placed=%1 createdWires=%2 residualRatsnests=%3")
+					 .arg(placed)
+					 .arg(created)
+					 .arg(residualRatsnests));
+	}
+	else
+	{
+		Q_EMIT setProgressMessage2(QObject::tr("Placed %1 part(s), created %2 breadboard jumper wire(s).").arg(placed).arg(created));
+		logAutoroute(QString("success: placed=%1 createdWires=%2").arg(placed).arg(created));
+	}
+	// Diagnostic: any rubber-band leg with more than two points has been
+	// reshaped after placement set it to a straight root-to-hole lead.
+	Q_FOREACH (QGraphicsItem *graphicsItem, m_sketchWidget->scene()->items())
+	{
+		auto *connectorItem = dynamic_cast<ConnectorItem *>(graphicsItem);
+		if (connectorItem == nullptr || !connectorItem->hasRubberBandLeg())
+			continue;
+		const QPolygonF leg = connectorItem->sceneAdjustedLeg();
+		if (leg.count() <= 2)
+			continue;
+		QStringList points;
+		Q_FOREACH (const QPointF &point, leg)
+			points << QString("(%1,%2)").arg(point.x()).arg(point.y());
+		logAutoroute(QString("leg audit: %1 points=%2 %3")
+						 .arg(connectorSummary(connectorItem))
+						 .arg(leg.count())
+						 .arg(points.join(" ")));
+	}
 	logAutoroute("========== breadboard autoroute end ==========");
 }
 
 int BreadboardAutorouter::clearPreviousAutorouteWires()
 {
 	QList<Wire *> generatedWires;
+	QList<Wire *> normalBreadboardWires;
+	int ratsnestCount = 0;
 	Q_FOREACH (QGraphicsItem *graphicsItem, m_sketchWidget->scene()->items())
 	{
 		auto *wire = dynamic_cast<Wire *>(graphicsItem);
 		if (wire == nullptr)
 			continue;
-		if ((wire->wireFlags() & generatedWireFlags()) != generatedWireFlags())
+
+		if (wire->getRatsnest())
+		{
+			ratsnestCount++;
 			continue;
-		generatedWires.append(wire);
+		}
+		if (!wire->getNormal())
+			continue;
+		if (wire->viewID() != ViewLayer::BreadboardView)
+			continue;
+
+		ConnectorItem *from = wire->connector0() == nullptr ? nullptr : wire->connector0()->firstConnectedToIsh();
+		ConnectorItem *to = wire->connector1() == nullptr ? nullptr : wire->connector1()->firstConnectedToIsh();
+		const bool touchesBreadboard = connectedBreadboardHoleFor(from) != nullptr
+		                            || connectedBreadboardHoleFor(to) != nullptr
+		                            || isTargetBreadboardHole(from)
+		                            || isTargetBreadboardHole(to);
+		if (!touchesBreadboard)
+			continue;
+
+		normalBreadboardWires.append(wire);
+		if (wire->getAutoroutable() || wire->hasFlag(ViewGeometry::AutoroutableFlag))
+			generatedWires.append(wire);
 	}
 
+	if (generatedWires.isEmpty() && ratsnestCount == 0)
+	{
+		generatedWires = normalBreadboardWires;
+	}
+	else if (!generatedWires.isEmpty() && ratsnestCount == 0)
+	{
+		Q_FOREACH (Wire *wire, normalBreadboardWires)
+		{
+			if (!generatedWires.contains(wire))
+				generatedWires.append(wire);
+		}
+	}
+
+	QSet<Wire *> unique;
+	QList<Wire *> uniqueGeneratedWires;
+	Q_FOREACH (Wire *wire, generatedWires)
+	{
+		if (wire == nullptr || unique.contains(wire))
+			continue;
+		unique.insert(wire);
+		uniqueGeneratedWires.append(wire);
+	}
+	generatedWires = uniqueGeneratedWires;
+
 	if (generatedWires.isEmpty())
+	{
+		logAutoroute(QString("clear previous: none ratsnests=%1 normalBreadboardWires=%2")
+		             .arg(ratsnestCount)
+		             .arg(normalBreadboardWires.count()));
 		return 0;
+	}
 
 	auto *parentCommand = new QUndoCommand(QObject::tr("Clear breadboard autoroute"));
 	new CleanUpWiresCommand(m_sketchWidget, CleanUpWiresCommand::UndoOnly, parentCommand);
@@ -421,6 +575,10 @@ int BreadboardAutorouter::clearPreviousAutorouteWires()
 	new CleanUpWiresCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, parentCommand);
 	m_sketchWidget->undoStack()->push(parentCommand);
 
+	logAutoroute(QString("clear previous: removed=%1 ratsnests=%2 normalBreadboardWires=%3")
+	             .arg(generatedWires.count())
+	             .arg(ratsnestCount)
+	             .arg(normalBreadboardWires.count()));
 	return generatedWires.count();
 }
 
@@ -445,6 +603,7 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 	QHash<ConnectorItem *, int> netForConnector;
 	QHash<int, QList<ConnectorItem *>> connectorsForNet;
 	QHash<ConnectorItem *, ConnectorItem *> placedTargets;
+	QHash<ConnectorItem *, ConnectorItem *> newlyPlacedTargets;
 	int candidateAttempts = 0;
 	int rejectedPinGeometry = 0;
 	int rejectedSameBus = 0;
@@ -469,7 +628,10 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 				continue;
 			netForConnector.insert(connectorItem, netIndex);
 			connectorsForNet[netIndex].append(connectorItem);
-			ConnectorItem *breadboardHole = breadboardHoleFor(connectorItem);
+			if (connectorItem->connectorType() == Connector::Female
+			    || connectorItem->attachedToItemType() == ModelPart::Wire)
+				continue;
+			ConnectorItem *breadboardHole = connectedBreadboardHoleFor(connectorItem);
 			if (breadboardHole != nullptr && breadboardHole->connectorType() == Connector::Female)
 			{
 				placedTargets.insert(connectorItem, breadboardHole);
@@ -521,6 +683,33 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 		breadboardCenter += hole->sceneAdjustedTerminalPoint(nullptr);
 	}
 	breadboardCenter /= breadboardHoles.count();
+
+	// connectorsShareBreadboardBus() rebuilds the bus member list on every
+	// call, which is far too slow inside the O(holes^2) candidate loops.
+	// Precompute one integer bus id per hole and compare those instead.
+	QHash<ConnectorItem *, int> busIdForHole;
+	QHash<ConnectorItem *, QPointF> holePositions;
+	{
+		int busCount = 0;
+		Q_FOREACH (ConnectorItem *hole, breadboardHoles)
+		{
+			holePositions.insert(hole, hole->sceneAdjustedTerminalPoint(nullptr));
+			if (busIdForHole.contains(hole))
+				continue;
+			const int busId = busCount++;
+			busIdForHole.insert(hole, busId);
+			ItemBase *board = hole->attachedTo();
+			QList<ConnectorItem *> busHoles;
+			if (board != nullptr && board->busConnectorItems(hole, busHoles))
+			{
+				Q_FOREACH (ConnectorItem *sibling, busHoles)
+					busIdForHole.insert(sibling, busId);
+			}
+		}
+	}
+	auto holesShareBus = [&busIdForHole](ConnectorItem *first, ConnectorItem *second) {
+		return busIdForHole.value(first, -1) == busIdForHole.value(second, -2);
+	};
 
 	QList<ItemBase *> movableParts;
 	int skippedNull = 0;
@@ -710,6 +899,58 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 	new CleanUpRatsnestsCommand(m_sketchWidget, CleanUpWiresCommand::UndoOnly, parentCommand);
 	int moved = 0;
 
+	auto conflictsWithPlacedNets = [&netForConnector, &placedTargets, &holesShareBus](const QHash<ConnectorItem *, ConnectorItem *> &pinToHole) {
+		for (auto candidate = pinToHole.constBegin(); candidate != pinToHole.constEnd(); ++candidate)
+		{
+			const int candidateNet = netForConnector.value(candidate.key(), -1);
+			if (candidateNet < 0 || candidate.value() == nullptr)
+				continue;
+			for (auto placed = placedTargets.constBegin(); placed != placedTargets.constEnd(); ++placed)
+			{
+				const int placedNet = netForConnector.value(placed.key(), -1);
+				if (placedNet < 0 || placedNet == candidateNet || placed.value() == nullptr)
+					continue;
+				if (holesShareBus(candidate.value(), placed.value()))
+					return true;
+			}
+		}
+		return false;
+	};
+
+	auto netPlacementCost = [this, &netForConnector, &connectorsForNet, &placedTargets, &breadboardCenter, &holesShareBus, &holePositions](ConnectorItem *pin, ConnectorItem *targetHole) {
+		const int netIndex = netForConnector.value(pin, -1);
+		if (netIndex < 0 || targetHole == nullptr)
+			return 0.0;
+
+		const QPointF targetPos = holePositions.value(targetHole, targetHole->sceneAdjustedTerminalPoint(nullptr));
+		double bestDistance = std::numeric_limits<double>::max();
+		bool hasPlacedTarget = false;
+		bool sharesPlacedBus = false;
+		Q_FOREACH (ConnectorItem *other, connectorsForNet.value(netIndex))
+		{
+			if (other == pin)
+				continue;
+			ConnectorItem *otherTarget = placedTargets.value(other, nullptr);
+			if (otherTarget == nullptr)
+				continue;
+			hasPlacedTarget = true;
+			bestDistance = qMin(bestDistance, manhattanDistance(targetPos, holePositions.value(otherTarget, otherTarget->sceneAdjustedTerminalPoint(nullptr))));
+			if (holesShareBus(targetHole, otherTarget))
+				sharesPlacedBus = true;
+		}
+
+		if (!hasPlacedTarget)
+			return manhattanDistance(targetPos, breadboardCenter) * 0.05;
+		if (sharesPlacedBus)
+			return bestDistance * 0.01;
+
+		// One additional occupied bus implies at least one additional jumper.
+		// The tunable penalty keeps that lexicographically more important
+		// than geometric terms by default; lowering it makes the router trade
+		// jumpers for shorter, straighter component leads.
+		return m_jumperPenalty + bestDistance;
+	};
+
 	Q_FOREACH (ItemBase *part, movableParts)
 	{
 		QList<ConnectorItem *> pins;
@@ -803,6 +1044,11 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 						rejectedSameBus++;
 						continue;
 					}
+					if (conflictsWithPlacedNets(pinToHole))
+					{
+						rejectedSameBus++;
+						continue;
+					}
 
 					QRectF movedBounds = part->sceneBoundingRect().translated(offset);
 					QRectF movedKeepout = movedBounds.adjusted(-PlacementKeepoutMargin, -PlacementKeepoutMargin, PlacementKeepoutMargin, PlacementKeepoutMargin);
@@ -831,36 +1077,7 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 					double score = manhattanDistance(movedBounds.center(), breadboardCenter) * 0.15;
 
 					Q_FOREACH (ConnectorItem *pin, pins)
-					{
-						int netIndex = netForConnector.value(pin, -1);
-						if (netIndex < 0)
-							continue;
-
-						ConnectorItem *targetHole = pinToHole.value(pin, nullptr);
-						if (targetHole == nullptr)
-							continue;
-						QPointF targetPos = targetHole->sceneAdjustedTerminalPoint(nullptr);
-
-						double bestNetDistance = std::numeric_limits<double>::max();
-						Q_FOREACH (ConnectorItem *other, connectorsForNet.value(netIndex))
-						{
-							if (other == pin)
-								continue;
-							ConnectorItem *otherTarget = placedTargets.value(other, nullptr);
-							if (otherTarget == nullptr)
-								continue;
-							bestNetDistance = qMin(bestNetDistance, manhattanDistance(targetPos, otherTarget->sceneAdjustedTerminalPoint(nullptr)));
-						}
-
-						if (bestNetDistance == std::numeric_limits<double>::max())
-						{
-							score += manhattanDistance(targetPos, breadboardCenter) * 0.05;
-						}
-						else
-						{
-							score += bestNetDistance;
-						}
-					}
+						score += netPlacementCost(pin, pinToHole.value(pin, nullptr));
 
 					if (score < best.score)
 					{
@@ -889,11 +1106,48 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 							 .arg(connectorSummary(firstPin))
 							 .arg(connectorSummary(secondPin)));
 
+			const QPointF unflippedFirstPinPos = firstPin->sceneAdjustedTerminalPoint(nullptr);
+			const QPointF unflippedSecondPinPos = secondPin->sceneAdjustedTerminalPoint(nullptr);
+			const double pinPairSpan = QLineF(unflippedFirstPinPos, unflippedSecondPinPos).length();
+			const QRectF partBounds = part->sceneBoundingRect();
+			const QPointF partCenter = partBounds.center();
+			QElapsedTimer searchTimer;
+			searchTimer.start();
+			qint64 pairCount = 0;
+			qint64 shiftIterations = 0;
+			qint64 postCutoffEvaluations = 0;
+			// Both legs are capped, so viable hole pairs lie within an annulus
+			// around the pin spacing; everything else can be rejected on a
+			// single distance test before any geometry work.
+			const double maxHoleSpan = pinPairSpan + 2.0 * m_maxLegLength;
+
+			// Also search with the pins swapped, so crossed legs can uncross.
+			// Prefer a mirror across the pin axis (body stays upright) when
+			// the part's breadboard view allows flipping; otherwise fall back
+			// to a 180 degree rotation.
+			const bool axisMostlyHorizontal =
+				qAbs(unflippedSecondPinPos.x() - unflippedFirstPinPos.x())
+				>= qAbs(unflippedSecondPinPos.y() - unflippedFirstPinPos.y());
+			const Qt::Orientations flipOrientation = axisMostlyHorizontal ? Qt::Horizontal : Qt::Vertical;
+			const PinSwap swapMode = part->canFlip(flipOrientation)
+				? (axisMostlyHorizontal ? PinSwap::FlipHorizontal : PinSwap::FlipVertical)
+				: PinSwap::Rotate180;
+
+			for (int flip = 0; flip <= 1; flip++)
+			{
+			const PinSwap candidateSwap = flip == 1 ? swapMode : PinSwap::None;
+			const QPointF firstPinPos = swappedPoint(unflippedFirstPinPos, candidateSwap, partCenter);
+			const QPointF secondPinPos = swappedPoint(unflippedSecondPinPos, candidateSwap, partCenter);
+			const QPointF pinAxisDir = pinPairSpan > 0.001
+				? QPointF((secondPinPos.x() - firstPinPos.x()) / pinPairSpan,
+						  (secondPinPos.y() - firstPinPos.y()) / pinPairSpan)
+				: QPointF(1.0, 0.0);
+
 			Q_FOREACH (ConnectorItem *firstHole, breadboardHoles)
 			{
 				if (reservedHoles.contains(firstHole))
 					continue;
-				QPointF firstHolePos = firstHole->sceneAdjustedTerminalPoint(nullptr);
+				QPointF firstHolePos = holePositions.value(firstHole);
 				Q_FOREACH (ConnectorItem *secondHole, breadboardHoles)
 				{
 					if (firstHole == secondHole)
@@ -902,16 +1156,45 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 						continue;
 					candidateAttempts++;
 
-					if (connectorsShareBreadboardBus(firstHole, secondHole))
+					QPointF secondHolePos = holePositions.value(secondHole);
+					const double spanDx = secondHolePos.x() - firstHolePos.x();
+					const double spanDy = secondHolePos.y() - firstHolePos.y();
+					if (spanDx * spanDx + spanDy * spanDy > maxHoleSpan * maxHoleSpan)
+					{
+						rejectedPinGeometry++;
+						continue;
+					}
+
+					if (holesShareBus(firstHole, secondHole))
 					{
 						rejectedSameBus++;
 						continue;
 					}
+					pairCount++;
 
-					QPointF secondHolePos = secondHole->sceneAdjustedTerminalPoint(nullptr);
-					QPointF desiredCenter = (firstHolePos + secondHolePos) / 2.0;
-					QPointF offset = desiredCenter - part->sceneBoundingRect().center();
-					QRectF movedBounds = part->sceneBoundingRect().translated(offset);
+					// The body need not sit centered between its holes:
+					// sliding it along the pin axis lets both leads leave the
+					// body forward instead of folding back when the hole pair
+					// is narrower than the pin spacing. Leg length varies
+					// linearly with the slide along the axis, so the only
+					// shifts worth evaluating are the ones that zero each
+					// leg's axial component, plus their midpoint.
+					const QPointF baseCenter = (firstHolePos + secondHolePos) / 2.0;
+					const QPointF baseOffset = baseCenter - partCenter;
+					const QPointF baseFirstPin = firstPinPos + baseOffset;
+					const QPointF baseSecondPin = secondPinPos + baseOffset;
+					const double firstAxial = (firstHolePos.x() - baseFirstPin.x()) * pinAxisDir.x()
+											+ (firstHolePos.y() - baseFirstPin.y()) * pinAxisDir.y();
+					const double secondAxial = (secondHolePos.x() - baseSecondPin.x()) * pinAxisDir.x()
+											 + (secondHolePos.y() - baseSecondPin.y()) * pinAxisDir.y();
+					const double axialShifts[] = {(firstAxial + secondAxial) / 2.0, firstAxial, secondAxial};
+					for (double axialShift : axialShifts)
+					{
+					shiftIterations++;
+					QPointF desiredCenter = baseCenter
+										  + QPointF(pinAxisDir.x() * axialShift, pinAxisDir.y() * axialShift);
+					QPointF offset = desiredCenter - partCenter;
+					QRectF movedBounds = partBounds.translated(offset);
 					QRectF movedKeepout = movedBounds.adjusted(-BendablePlacementKeepoutMargin, -BendablePlacementKeepoutMargin, BendablePlacementKeepoutMargin, BendablePlacementKeepoutMargin);
 
 					if (!targetBoardBounds.contains(movedBounds))
@@ -935,63 +1218,68 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 						continue;
 					}
 
-					QPointF movedFirstPin = firstPin->sceneAdjustedTerminalPoint(nullptr) + offset;
-					QPointF movedSecondPin = secondPin->sceneAdjustedTerminalPoint(nullptr) + offset;
+					QPointF movedFirstPin = firstPinPos + offset;
+					QPointF movedSecondPin = secondPinPos + offset;
 					double firstLegLength = QLineF(movedFirstPin, firstHolePos).length();
 					double secondLegLength = QLineF(movedSecondPin, secondHolePos).length();
-					if (firstLegLength > MaxBendableLegLength || secondLegLength > MaxBendableLegLength)
+					if (firstLegLength > m_maxLegLength || secondLegLength > m_maxLegLength)
 					{
 						rejectedPinGeometry++;
 						continue;
 					}
 
 					acceptedCandidates++;
-					double score = manhattanDistance(movedBounds.center(), breadboardCenter) * 0.15 + firstLegLength + secondLegLength;
+					double score = manhattanDistance(movedBounds.center(), breadboardCenter) * 0.15
+								 + (firstLegLength + secondLegLength) * m_leadLengthWeight;
+
+					// Straight leads only look straight when they leave along
+					// the body axis. Penalize perpendicular drift (diagonal
+					// leads) and hole pairs tighter than the pin spacing
+					// (leads folding back under the body).
+					// pinPairSpan and pinAxisDir are translation-invariant, so
+					// reuse the values hoisted outside the candidate loops.
+					if (pinPairSpan > 0.001)
+					{
+						const QPointF firstLegVector = firstHolePos - movedFirstPin;
+						const QPointF secondLegVector = secondHolePos - movedSecondPin;
+						const double perpendicularDrift =
+							qAbs(pinAxisDir.x() * firstLegVector.y() - pinAxisDir.y() * firstLegVector.x())
+							+ qAbs(pinAxisDir.x() * secondLegVector.y() - pinAxisDir.y() * secondLegVector.x());
+						const double holeSpan = (secondHolePos.x() - firstHolePos.x()) * pinAxisDir.x()
+											  + (secondHolePos.y() - firstHolePos.y()) * pinAxisDir.y();
+						const double compression = qMax(0.0, pinPairSpan - holeSpan);
+						score += perpendicularDrift * m_leadAngleWeight + compression * m_foldbackWeight;
+					}
+
+					// Net placement costs only ever add, so a candidate whose
+					// geometric score already loses cannot win: skip the
+					// expensive conflict and net-cost evaluation entirely.
+					if (score >= best.score)
+						continue;
+					postCutoffEvaluations++;
+
 					QHash<ConnectorItem *, ConnectorItem *> pinToHole;
 					pinToHole.insert(firstPin, firstHole);
 					pinToHole.insert(secondPin, secondHole);
+					if (conflictsWithPlacedNets(pinToHole))
+					{
+						rejectedSameBus++;
+						continue;
+					}
 
 					Q_FOREACH (ConnectorItem *pin, pins)
-					{
-						int netIndex = netForConnector.value(pin, -1);
-						if (netIndex < 0)
-							continue;
-
-						ConnectorItem *targetHole = pinToHole.value(pin, nullptr);
-						if (targetHole == nullptr)
-							continue;
-						QPointF targetPos = targetHole->sceneAdjustedTerminalPoint(nullptr);
-
-						double bestNetDistance = std::numeric_limits<double>::max();
-						Q_FOREACH (ConnectorItem *other, connectorsForNet.value(netIndex))
-						{
-							if (other == pin)
-								continue;
-							ConnectorItem *otherTarget = placedTargets.value(other, nullptr);
-							if (otherTarget == nullptr)
-								continue;
-							bestNetDistance = qMin(bestNetDistance, manhattanDistance(targetPos, otherTarget->sceneAdjustedTerminalPoint(nullptr)));
-						}
-
-						if (bestNetDistance == std::numeric_limits<double>::max())
-						{
-							score += manhattanDistance(targetPos, breadboardCenter) * 0.05;
-						}
-						else
-						{
-							score += bestNetDistance;
-						}
-					}
+						score += netPlacementCost(pin, pinToHole.value(pin, nullptr));
 
 					if (score < best.score)
 					{
 						best.newLoc = best.oldLoc + offset;
 						best.pinToHole = pinToHole;
 						best.pinToLeg.clear();
-						best.pinToLeg.insert(firstPin, translatedLegForTarget(firstPin, offset, firstHole));
-						best.pinToLeg.insert(secondPin, translatedLegForTarget(secondPin, offset, secondHole));
+						best.pinToLeg.insert(firstPin, translatedLegForTarget(firstPin, offset, firstHole, candidateSwap, partCenter));
+						best.pinToLeg.insert(secondPin, translatedLegForTarget(secondPin, offset, secondHole, candidateSwap, partCenter));
 						best.score = score;
 						best.usesLegPlacement = true;
+						best.pinSwap = candidateSwap;
 						logAutoroute(QString("bendable placement best update: part=%1 score=%2 offset=(%3,%4) holes=[%5 | %6] legLengths=[%7,%8]")
 										 .arg(itemSummary(part))
 										 .arg(score)
@@ -1002,8 +1290,16 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 										 .arg(firstLegLength)
 										 .arg(secondLegLength));
 					}
+					} // axialShift loop
 				}
 			}
+			} // flip loop
+			logAutoroute(QString("bendable search profile: %1 elapsedMs=%2 pairs=%3 shiftIterations=%4 postCutoffEvaluations=%5")
+							 .arg(itemSummary(part))
+							 .arg(searchTimer.elapsed())
+							 .arg(pairCount)
+							 .arg(shiftIterations)
+							 .arg(postCutoffEvaluations));
 		}
 
 		if (best.pinToHole.isEmpty())
@@ -1013,6 +1309,26 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 			continue;
 		}
 
+		// Transform strictly BEFORE the move and before any pins are bound:
+		// transforming a part whose legs are already attached would drag the
+		// leg geometry off its assigned holes.
+		switch (best.pinSwap)
+		{
+		case PinSwap::FlipHorizontal:
+			new FlipItemCommand(m_sketchWidget, part->id(), Qt::Horizontal, parentCommand);
+			logAutoroute(QString("placement flip: %1 mirrored horizontally").arg(itemSummary(part)));
+			break;
+		case PinSwap::FlipVertical:
+			new FlipItemCommand(m_sketchWidget, part->id(), Qt::Vertical, parentCommand);
+			logAutoroute(QString("placement flip: %1 mirrored vertically").arg(itemSummary(part)));
+			break;
+		case PinSwap::Rotate180:
+			new RotateItemCommand(m_sketchWidget, part->id(), &FlipRotationDegrees, parentCommand);
+			logAutoroute(QString("placement flip: %1 rotated 180").arg(itemSummary(part)));
+			break;
+		default:
+			break;
+		}
 		ViewGeometry oldGeometry(part->getViewGeometry());
 		ViewGeometry newGeometry(part->getViewGeometry());
 		newGeometry.setLoc(best.newLoc);
@@ -1031,20 +1347,37 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 			ConnectorItem *hole = it.value();
 			if (pin == nullptr || hole == nullptr)
 				continue;
-			new ChangeConnectionCommand(m_sketchWidget, BaseCommand::CrossView,
+			auto *connectionCommand = new ChangeConnectionCommand(m_sketchWidget, BaseCommand::CrossView,
 										pin->attachedToID(), pin->connectorSharedID(),
 										hole->attachedToID(), hole->connectorSharedID(),
 										ViewLayer::specFromID(hole->attachedToViewLayerID()),
 										true, parentCommand);
+			// Placement already specifies the exact pin and hole. Geometry-driven
+			// updates while the part and its legs are moving can detach that pair.
+			connectionCommand->setUpdateConnections(false);
 			logAutoroute(QString("placement connection: pin=%1 hole=%2 sameBus?=%3")
 							 .arg(connectorSummary(pin))
 							 .arg(connectorSummary(hole))
 							 .arg(connectorsShareBreadboardBus(pin, hole) ? "yes" : "no"));
 			reservedHoles.insert(hole);
 			placedTargets.insert(pin, hole);
+			newlyPlacedTargets.insert(pin, hole);
 
 			QPolygonF newLeg = best.pinToLeg.value(pin);
-			if (best.usesLegPlacement && newLeg.count() >= 2)
+			if (!best.usesLegPlacement && pin->hasRubberBandLeg())
+			{
+				// A rigid move translates the loose sketch's bent leg shape
+				// verbatim, so historical bends survive placement. Replace the
+				// shape with a direct root-to-hole lead.
+				QPolygonF looseLeg = pin->sceneAdjustedLeg();
+				if (looseLeg.count() >= 2)
+				{
+					newLeg.clear();
+					newLeg << looseLeg.first() + (best.newLoc - best.oldLoc);
+					newLeg << hole->sceneAdjustedTerminalPoint(nullptr);
+				}
+			}
+			if (newLeg.count() >= 2)
 			{
 				m_componentLeadLength += polylineLength(newLeg);
 				QPolygonF oldLeg = pin->sceneAdjustedLeg();
@@ -1118,6 +1451,14 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 	}
 
 	m_sketchWidget->undoStack()->push(parentCommand);
+	QStringList connectionFailures;
+	if (!verifyPlacedConnections(newlyPlacedTargets, connectionFailures))
+	{
+		m_lastPlacementReport = QObject::tr("Placed component pins did not attach to their assigned breadboard holes:\n%1")
+								.arg(connectionFailures.join('\n'));
+		logAutoroute(QString("autoplace connection verification failed:\n%1").arg(m_lastPlacementReport));
+		return -1;
+	}
 	logAutoroute(QString("autoplace counters: moved=%1 placedRigid=%2 placedWithLegs=%3 candidateAttempts=%4 acceptedCandidates=%5 rejectedPinGeometry=%6 rejectedSameBus=%7 rejectedOffBoard=%8 rejectedOverlap=%9 rejectedByPolicy=%10 leftPeripheral=%11 failedBoardFit=%12")
 					 .arg(moved)
 					 .arg(placedRigid)
@@ -1132,6 +1473,51 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 					 .arg(leftPeripheral)
 					 .arg(failedBoardFit));
 	return moved;
+}
+
+bool BreadboardAutorouter::verifyPlacedConnections(const QHash<ConnectorItem *, ConnectorItem *> &placedTargets,
+													 QStringList &failures) const
+{
+	constexpr double EndpointTolerance = 1.0;
+	for (auto it = placedTargets.constBegin(); it != placedTargets.constEnd(); ++it)
+	{
+		ConnectorItem *pin = it.key();
+		ConnectorItem *hole = it.value();
+		if (pin == nullptr || hole == nullptr)
+		{
+			failures.append(QObject::tr("Null pin or hole in placement result."));
+			continue;
+		}
+
+		const bool pinConnected = pin->connectedToItems().contains(hole);
+		const bool holeConnected = hole->connectedToItems().contains(pin);
+		double endpointDistance = 0.0;
+		if (pin->hasRubberBandLeg())
+		{
+			const QPolygonF leg = pin->sceneAdjustedLeg();
+			endpointDistance = leg.isEmpty()
+				? std::numeric_limits<double>::infinity()
+				: QLineF(leg.last(), hole->sceneAdjustedTerminalPoint(nullptr)).length();
+		}
+
+		if (!pinConnected || !holeConnected || endpointDistance > EndpointTolerance)
+		{
+			failures.append(QObject::tr("%1 -> %2: pinConnected=%3, holeConnected=%4, legEndpointDistance=%5")
+							.arg(connectorSummary(pin))
+							.arg(connectorSummary(hole))
+							.arg(pinConnected ? "yes" : "no")
+							.arg(holeConnected ? "yes" : "no")
+							.arg(endpointDistance));
+		}
+		else
+		{
+			logAutoroute(QString("placement verified: pin=%1 hole=%2 endpointDistance=%3")
+							 .arg(connectorSummary(pin))
+							 .arg(connectorSummary(hole))
+							 .arg(endpointDistance));
+		}
+	}
+	return failures.isEmpty();
 }
 
 int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
@@ -1280,6 +1666,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 	int created = 0;
 	int wiredPeripheral = 0;
 	int allocatedPeripheralLanes = 0;
+	double peripheralLeadLength = 0.0;
 
 	BreadboardTopology topology;
 	topology.discover(m_sketchWidget->scene(), m_sketchWidget->scene()->selectedItems());
@@ -1500,7 +1887,9 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 					if (terminal == nullptr || target == nullptr)
 						continue;
 					m_sketchWidget->createWire(terminal, target, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
-					plannedSegments.append(connectorLine(terminal, target));
+					const QLineF peripheralLead = connectorLine(terminal, target);
+					plannedSegments.append(peripheralLead);
+					peripheralLeadLength += peripheralLead.length();
 					routeReservedHoles.insert(target);
 					created++;
 					wiredPeripheral++;
@@ -1586,7 +1975,9 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 								 .arg(bestRoute.segments.count())
 							 .arg(bestBridgeScore.toString()));
 				m_sketchWidget->createWire(terminal, bestEntry, generatedWireFlags(), false, BaseCommand::SingleView, parentCommand);
-				plannedSegments.append(connectorLine(terminal, bestEntry));
+				const QLineF peripheralLead = connectorLine(terminal, bestEntry);
+				plannedSegments.append(peripheralLead);
+				peripheralLeadLength += peripheralLead.length();
 				usedBridgeTargets.insert(bestEntry);
 				routeReservedHoles.insert(bestEntry);
 				created++;
@@ -1700,12 +2091,16 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 
 	double jumperLength = 0.0;
 	Q_FOREACH (const QLineF &segment, plannedSegments) jumperLength += segment.length();
+	jumperLength = qMax(0.0, jumperLength - peripheralLeadLength);
 	m_lastRoutingScore.failedNets = failedNetIndices.count();
-	m_lastRoutingScore.jumperCount = created;
+	m_lastRoutingScore.jumperCount = created - wiredPeripheral;
 	m_lastRoutingScore.jumperLength = jumperLength;
 	m_lastRoutingScore.componentLeadLength = m_componentLeadLength;
-	logAutoroute(QString("route counters: wiredPeripheral=%1 allocatedPeripheralLanes=%2 failedNets=%3")
+	logAutoroute(QString("route counters: totalWires=%1 boardJumpers=%2 wiredPeripheral=%3 peripheralLeadLength=%4 allocatedPeripheralLanes=%5 failedNets=%6")
+				 .arg(created)
+				 .arg(created - wiredPeripheral)
 				 .arg(wiredPeripheral)
+				 .arg(peripheralLeadLength)
 				 .arg(allocatedPeripheralLanes)
 				 .arg(failedNetIndices.count()));
 	return created;
@@ -1713,36 +2108,73 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 
 QList<QList<ConnectorItem *>> BreadboardAutorouter::collectCandidateGroups(const QList<ConnectorItem *> &candidates) const
 {
-	QList<QList<ConnectorItem *>> groups;
-	QList<ConnectorItem *> todo = candidates;
-
-	while (!todo.isEmpty())
+	QList<ConnectorItem *> validCandidates;
+	Q_FOREACH (ConnectorItem *candidate, candidates)
 	{
-		ConnectorItem *first = todo.takeFirst();
-		if (first == nullptr)
-			continue;
-
-		QList<ConnectorItem *> equalPotential;
-		equalPotential.append(first);
-		ConnectorItem::collectEqualPotential(equalPotential, false, ViewGeometry::RatsnestFlag);
-
-		QList<ConnectorItem *> group;
-		Q_FOREACH (ConnectorItem *candidate, candidates)
-		{
-			if (candidate == nullptr)
-				continue;
-			if (!equalPotential.contains(candidate))
-				continue;
-			if (!group.contains(candidate))
-				group.append(candidate);
-			todo.removeOne(candidate);
-		}
-
-		if (!group.isEmpty())
-			groups.append(group);
+		if (candidate != nullptr && !validCandidates.contains(candidate))
+			validCandidates.append(candidate);
 	}
 
-	return groups;
+	QVector<int> parents(validCandidates.count());
+	for (int i = 0; i < parents.count(); i++) parents[i] = i;
+	auto findRoot = [&parents](int value) {
+		int root = value;
+		while (parents[root] != root) root = parents[root];
+		while (parents[value] != value) {
+			const int next = parents[value];
+			parents[value] = root;
+			value = next;
+		}
+		return root;
+	};
+	auto unite = [&parents, &findRoot](int first, int second) {
+		const int firstRoot = findRoot(first);
+		const int secondRoot = findRoot(second);
+		if (firstRoot != secondRoot) parents[secondRoot] = firstRoot;
+	};
+
+	// Breadboard connectivity is deliberately narrower than Fritzing's global
+	// equal-potential graph. A ratsnest describes intent, not copper. Only a
+	// discovered breadboard bus or a real Breadboard View wire joins groups.
+	for (int first = 0; first < validCandidates.count(); first++)
+	{
+		for (int second = first + 1; second < validCandidates.count(); second++)
+		{
+			if (connectorsShareBreadboardBus(validCandidates.at(first), validCandidates.at(second)))
+				unite(first, second);
+		}
+	}
+
+	Q_FOREACH (QGraphicsItem *graphicsItem, m_sketchWidget->scene()->items())
+	{
+		auto *wire = dynamic_cast<Wire *>(graphicsItem);
+		if (wire == nullptr || wire->getRatsnest() || !wire->getNormal())
+			continue;
+		if (wire->viewID() != ViewLayer::BreadboardView)
+			continue;
+
+		ConnectorItem *from = routingConnectorFor(wire->connector0());
+		ConnectorItem *to = routingConnectorFor(wire->connector1());
+		if (from == nullptr || to == nullptr)
+			continue;
+
+		for (int first = 0; first < validCandidates.count(); first++)
+		{
+			if (!connectorsShareBreadboardBus(validCandidates.at(first), from))
+				continue;
+			for (int second = 0; second < validCandidates.count(); second++)
+			{
+				if (connectorsShareBreadboardBus(validCandidates.at(second), to))
+					unite(first, second);
+			}
+		}
+	}
+
+	QHash<int, QList<ConnectorItem *>> groupsByRoot;
+	for (int i = 0; i < validCandidates.count(); i++)
+		groupsByRoot[findRoot(i)].append(validCandidates.at(i));
+
+	return groupsByRoot.values();
 }
 
 int BreadboardAutorouter::countUnresolvedNets() const
@@ -1824,6 +2256,16 @@ QString BreadboardAutorouter::itemSummary(ItemBase *itemBase) const
 		.arg(itemBase->moduleID());
 }
 
+void BreadboardAutorouter::loadTuning()
+{
+	QSettings settings;
+	m_maxLegLength = settings.value("breadboardAutorouter/leadStretchLimit", 120.0).toDouble();
+	m_leadLengthWeight = settings.value("breadboardAutorouter/leadLengthWeight", 1.0).toDouble();
+	m_jumperPenalty = settings.value("breadboardAutorouter/jumperPenalty", 100000.0).toDouble();
+	m_leadAngleWeight = settings.value("breadboardAutorouter/leadAngleWeight", 4.0).toDouble();
+	m_foldbackWeight = settings.value("breadboardAutorouter/foldbackWeight", 6.0).toDouble();
+}
+
 QString BreadboardAutorouter::logFilePath() const
 {
 	QString dir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
@@ -1899,11 +2341,7 @@ ConnectorItem *BreadboardAutorouter::breadboardHoleFor(ConnectorItem *partConnec
 	if (partConnector == nullptr)
 		return nullptr;
 	if (partConnector->connectorType() == Connector::Female)
-	{
-		if (partConnector->connectionsCount() == 0)
-			return partConnector;
-		return nearestFreeBusHole(partConnector);
-	}
+		return partConnector;
 
 	Q_FOREACH (ConnectorItem *connectorItem, partConnector->connectedToItems())
 	{

@@ -23,6 +23,7 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <QObject>
 #include <QList>
+#include <QStringList>
 
 #include "../viewgeometry.h"
 #include "../connectors/connectoritem.h"
@@ -51,6 +52,7 @@ Q_SIGNALS:
 private:
 	int clearPreviousAutorouteWires();
 	int autoplacePartsOnBreadboard();
+	bool verifyPlacedConnections(const QHash<ConnectorItem *, ConnectorItem *> &placedTargets, QStringList &failures) const;
 	int routeCollectedNets(QUndoCommand * parentCommand);
 	int routeRatsnestDemands(QUndoCommand * parentCommand);
 	QList< QList<ConnectorItem *> > collectCandidateGroups(const QList<ConnectorItem *> & candidates) const;
@@ -76,6 +78,7 @@ private:
 	double routeScore(ConnectorItem * from, ConnectorItem * to) const;
 	int countUnresolvedNets() const;
 	void clearCollectedNets();
+	void loadTuning();
 
 private:
 	BreadboardSketchWidget * m_sketchWidget = nullptr;
@@ -83,6 +86,14 @@ private:
 	QString m_lastPlacementReport;
 	BreadboardRoutingScore m_lastRoutingScore;
 	double m_componentLeadLength = 0.0;
+
+	// Placement tuning weights, read from QSettings at every start() so the
+	// toolbar sliders take effect without restarting. Defaults live here.
+	double m_maxLegLength = 120.0;
+	double m_leadLengthWeight = 1.0;
+	double m_jumperPenalty = 100000.0;
+	double m_leadAngleWeight = 4.0;
+	double m_foldbackWeight = 6.0;
 };
 
 #endif
