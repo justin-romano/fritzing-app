@@ -131,10 +131,12 @@ void BreadboardRouteGraphCore::buildStaticEdges()
 }
 
 BreadboardRouteGraphCore::QueryContext BreadboardRouteGraphCore::prepareQuery(const QVector<bool> & holeBlocked,
+																			  const QVector<bool> & busBlocked,
 																			  const QList<QLineF> & congestionSegments) const
 {
 	QueryContext context;
 	context.holeBlocked = holeBlocked;
+	context.busBlocked = busBlocked;
 	context.edgeCongestion = QVector<double>(m_edges.count(), 0.0);
 
 	// Bounding boxes let most (edge, segment) pairs be rejected without the
@@ -174,6 +176,11 @@ BreadboardRouteGraphCore::MultiResult BreadboardRouteGraphCore::routeFrom(int so
 	if (sourceBus < 0)
 		return multi;
 
+	// A source on a foreign-owned bus is a caller error: routing from it
+	// would already imply a schematic-breaking connection.
+	if (sourceBus < context.busBlocked.count() && context.busBlocked.at(sourceBus))
+		return multi;
+
 	multi.sourceHole = sourceHole;
 	multi.sourceBus = sourceBus;
 	const int busCount = m_holesByBus.count();
@@ -207,6 +214,10 @@ BreadboardRouteGraphCore::MultiResult BreadboardRouteGraphCore::routeFrom(int so
 		Q_FOREACH (int edgeIndex, m_edgesByBus.at(currentBus))
 		{
 			const Edge & edge = m_edges.at(edgeIndex);
+			// No endpoint exemption for buses: landing on or passing through
+			// a foreign-owned bus electrically breaks the schematic.
+			if (edge.toBus < context.busBlocked.count() && context.busBlocked.at(edge.toBus))
+				continue;
 			if (!holeAvailable(edge.fromHole) || !holeAvailable(edge.toHole))
 				continue;
 

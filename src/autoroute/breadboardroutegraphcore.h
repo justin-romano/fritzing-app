@@ -72,13 +72,18 @@ public:
 	// Rebuild the context whenever reserved holes or planned segments change.
 	struct QueryContext {
 		QVector<bool> holeBlocked;
+		QVector<bool> busBlocked;
 		QVector<double> edgeCongestion;
 	};
 
 	// holeBlocked[i]: hole may not be used (reserved/occupied); start and
-	// target holes are always usable. congestionSegments: already-planned
-	// wires; crossing or overlapping them penalizes an edge.
+	// target holes are always usable. busBlocked[b]: the bus is owned by a
+	// foreign net (or a no-net pin) and must not be landed on or traversed -
+	// unlike hole blocking there is NO endpoint exemption, because touching
+	// a foreign bus electrically breaks the schematic. congestionSegments:
+	// already-planned wires; crossing or overlapping them penalizes an edge.
 	QueryContext prepareQuery(const QVector<bool> & holeBlocked,
+							  const QVector<bool> & busBlocked,
 							  const QList<QLineF> & congestionSegments) const;
 
 	Result route(int startHole, int targetHole, const QueryContext & context) const;

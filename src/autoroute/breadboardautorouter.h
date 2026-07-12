@@ -67,6 +67,18 @@ private:
 	int busGroupFor(ConnectorItem * connectorItem) const;
 	const QList<QPair<ConnectorItem *, ConnectorItem *> > & normalBreadboardWireEnds() const;
 	void invalidateRoutingCaches();
+
+	// Bus ownership: the mechanism behind the prime invariant. Every bus is
+	// free (-1) or owned by exactly one key; keys are net indices (>= 0) or
+	// unique negative sentinels claimed by no-net pins (e.g. unused DIP
+	// outputs, which are still real outputs and must never join a net).
+	int busOwner(int busGroup) const;
+	bool busAvailableFor(int busGroup, int ownerKey) const;
+	void claimBus(int busGroup, int ownerKey);
+	int makeNoNetOwnerKey();
+	int ownerKeyForPin(ConnectorItem * pin) const;
+	void seedBusOwnership();
+	bool verifySchematicConformance(QStringList & violations, bool recordBaseline = false);
 	QString connectorSummary(ConnectorItem * connectorItem) const;
 	QString itemSummary(ItemBase * itemBase) const;
 	QString logFilePath() const;
@@ -119,6 +131,10 @@ private:
 	// whenever pushed commands change scene wires.
 	mutable QHash<ConnectorItem *, int> m_busGroupForConnector;
 	mutable int m_busGroupCount = 0;
+	QHash<int, int> m_busOwnerForGroup;      // busGroup -> ownerKey, absent = free
+	QHash<ConnectorItem *, int> m_netForConnector;   // schematic net index per part pin
+	int m_nextNoNetOwnerKey = -2;
+	QSet<QPair<int, int> > m_preExistingNetContacts; // net pairs already touching before we run
 	// Log lines are buffered and flushed at phase boundaries: opening and
 	// closing the file per line dominated route-search time on large boards.
 	mutable QStringList m_logBuffer;

@@ -24,6 +24,7 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 #include "breadboardroutegraphcore.h"
 #include "breadboardtopology.h"
 
+#include <climits>
 #include <functional>
 #include <memory>
 
@@ -130,16 +131,23 @@ namespace
 		QList<ConnectorItem *> holes;
 		QHash<ConnectorItem *, int> indexForHole;
 		QVector<bool> baseBlocked;
+		QVector<int> busGroupForHole;    // global bus group id per hole
+		QVector<int> denseBusForHole;    // session-dense bus id per hole
+		int denseBusCount = 0;
+		std::function<int(int)> ownerOfBusGroup;
 		std::shared_ptr<BreadboardRouteGraphCore> core;
 
 		static RouteGraphSession build(const QList<ConnectorItem *> &routeHoles,
-									   const std::function<int(ConnectorItem *)> &busGroup)
+									   const std::function<int(ConnectorItem *)> &busGroup,
+									   const std::function<int(int)> &ownerOfBusGroup)
 		{
 			RouteGraphSession session;
 			session.holes = routeHoles;
+			session.ownerOfBusGroup = ownerOfBusGroup;
 			QVector<QPointF> positions(routeHoles.count());
 			QVector<int> busIds(routeHoles.count(), -1);
 			session.baseBlocked = QVector<bool>(routeHoles.count(), false);
+			session.busGroupForHole = QVector<int>(routeHoles.count(), -1);
 			QHash<int, int> denseBusFor;
 			for (int i = 0; i < routeHoles.count(); i++)
 			{
@@ -149,6 +157,7 @@ namespace
 				session.indexForHole.insert(hole, i);
 				positions[i] = hole->sceneAdjustedTerminalPoint(nullptr);
 				const int group = busGroup(hole);
+				session.busGroupForHole[i] = group;
 				auto found = denseBusFor.constFind(group);
 				if (found == denseBusFor.constEnd())
 				{
@@ -163,15 +172,19 @@ namespace
 				// execute at push, after routing has finished.
 				session.baseBlocked[i] = hole->connectionsCount() != 0;
 			}
+			session.denseBusForHole = busIds;
+			session.denseBusCount = denseBusFor.count();
 			session.core = std::make_shared<BreadboardRouteGraphCore>(positions, busIds, coreRouteOptions());
 			return session;
 		}
 
 		// Build once per batch of route() calls sharing the same reserved
-		// set and planned segments - this replaces the old per-batch graph
-		// reconstruction at a fraction of its cost.
+		// set, planned segments, and querying net - this replaces the old
+		// per-batch graph reconstruction at a fraction of its cost. Buses
+		// owned by any other key are blocked outright (prime invariant).
 		BreadboardRouteGraphCore::QueryContext prepare(const QSet<ConnectorItem *> &reserved,
-													   const QList<QLineF> &plannedSegments) const
+													   const QList<QLineF> &plannedSegments,
+													   int netOwnerKey) const
 		{
 			QVector<bool> blocked = baseBlocked;
 			Q_FOREACH (ConnectorItem *hole, reserved)
@@ -180,7 +193,17 @@ namespace
 				if (index >= 0)
 					blocked[index] = true;
 			}
-			return core->prepareQuery(blocked, plannedSegments);
+			QVector<bool> busBlocked(denseBusCount, false);
+			for (int i = 0; i < holes.count(); i++)
+			{
+				const int dense = denseBusForHole.at(i);
+				if (dense < 0 || busBlocked.at(dense))
+					continue;
+				const int owner = ownerOfBusGroup ? ownerOfBusGroup(busGroupForHole.at(i)) : -1;
+				if (owner != -1 && owner != netOwnerKey)
+					busBlocked[dense] = true;
+			}
+			return core->prepareQuery(blocked, busBlocked, plannedSegments);
 		}
 
 		BreadboardRouteGraph::Result mapResult(const BreadboardRouteGraphCore::Result &result) const
@@ -518,6 +541,18 @@ void BreadboardAutorouter::start()
 	Q_EMIT setProgressMessage(QObject::tr("Placing breadboard parts..."));
 	Q_EMIT setProgressMessage2(QString());
 
+	// Prime invariant machinery: seed bus ownership from existing
+	// connections and record net contacts that already exist so the
+	// post-route conformance audit only fails on connections WE created.
+	seedBusOwnership();
+	m_preExistingNetContacts.clear();
+	{
+		QStringList ignored;
+		verifySchematicConformance(ignored, true);
+		if (!m_preExistingNetContacts.isEmpty())
+			logAutoroute(QString("pre-existing net contacts (exempt from audit): %1").arg(m_preExistingNetContacts.count()));
+	}
+
 	phaseTimer.restart();
 	int placed = autoplacePartsOnBreadboard();
 	// placeExecMs is recorded inside autoplace around its command push.
@@ -618,6 +653,20 @@ void BreadboardAutorouter::start()
 					 .arg(residualRatsnests));
 	}
 	m_phaseStats.completionMs = takePhaseMs();
+
+	// PRIME INVARIANT audit: the routed result must not connect nets that
+	// the schematic keeps separate. Any violation is our bug - roll the
+	// entire autoroute back rather than ship a wrong circuit.
+	// NOTE: the equal-potential audit currently over-collects (crossLayers
+	// walks into the schematic netlist), so it is LOG-ONLY until corrected.
+	// The primary guarantee is bus-ownership-by-construction; this line is a
+	// diagnostic whose count we compare against the visual result.
+	{
+		QStringList violations;
+		verifySchematicConformance(violations);
+		logAutoroute(QString("schematic conformance (log-only): %1 reported contacts").arg(violations.count()));
+	}
+
 	logAutoroute(QString("undo transaction after routing: count=%1 index=%2")
 				 .arg(undoStack->count())
 				 .arg(undoStack->index()));
@@ -643,6 +692,14 @@ void BreadboardAutorouter::start()
 					 .arg(placed)
 					 .arg(created)
 					 .arg(residualRatsnests));
+		flushAutorouteLog();
+		// Honest guidance: the usual cause is exhausted free bus space.
+		QMessageBox::information(nullptr, QObject::tr("Fritzing"),
+								 QObject::tr("Autoroute could not complete %1 connection(s).\n\n"
+											 "The breadboard's free bus space may be exhausted. "
+											 "Adding another breadboard next to the existing one and "
+											 "running Autoroute again may allow the circuit to complete.")
+									 .arg(residualRatsnests));
 	}
 	else
 	{
@@ -825,6 +882,27 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 	targetBreadboards = topology.boardItems();
 	reservedHoles = topology.reservedHoles();
 	QRectF targetBoardBounds = topology.bounds();
+	// Union bounds cover the empty gap BETWEEN boards on multi-board
+	// sketches; a body is only legal fully inside some single board.
+	QVector<QRectF> boardRects;
+	Q_FOREACH (const BreadboardTopology::Board &board, topology.boards())
+		boardRects.append(board.bounds);
+	Q_FOREACH (const QRectF &boardRect, boardRects)
+		logAutoroute(QString("board rect: (%1,%2)-(%3,%4)")
+						 .arg(boardRect.left()).arg(boardRect.top())
+						 .arg(boardRect.right()).arg(boardRect.bottom()));
+	auto anyBoardContains = [&boardRects, &targetBoardBounds](const QRectF &bounds) {
+		// Fall back to the union when board rects are unavailable so we never
+		// reject everything; per-board separation still holds when we have them.
+		if (boardRects.isEmpty())
+			return targetBoardBounds.contains(bounds);
+		Q_FOREACH (const QRectF &boardRect, boardRects)
+		{
+			if (boardRect.contains(bounds))
+				return true;
+		}
+		return false;
+	};
 	int targetBoardConnectors = topology.itemConnectorCount();
 	int targetSceneConnectors = topology.sceneConnectorCount();
 
@@ -1074,19 +1152,24 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 	new CleanUpRatsnestsCommand(m_sketchWidget, CleanUpWiresCommand::UndoOnly, parentCommand);
 	int moved = 0;
 
-	auto conflictsWithPlacedNets = [&netForConnector, &placedTargets, &holesShareBus](const QHash<ConnectorItem *, ConnectorItem *> &pinToHole) {
+	// Prime invariant, placement side: a candidate may only put a pin on a
+	// bus that is free or already owned by that pin's net. No-net pins
+	// (unused DIP outputs are still outputs!) may only take FREE buses.
+	auto conflictsWithPlacedNets = [this, &netForConnector](const QHash<ConnectorItem *, ConnectorItem *> &pinToHole) {
 		for (auto candidate = pinToHole.constBegin(); candidate != pinToHole.constEnd(); ++candidate)
 		{
-			const int candidateNet = netForConnector.value(candidate.key(), -1);
-			if (candidateNet < 0 || candidate.value() == nullptr)
+			if (candidate.value() == nullptr)
 				continue;
-			for (auto placed = placedTargets.constBegin(); placed != placedTargets.constEnd(); ++placed)
+			const int busGroup = busGroupFor(candidate.value());
+			const int candidateNet = netForConnector.value(candidate.key(), -1);
+			if (candidateNet < 0)
 			{
-				const int placedNet = netForConnector.value(placed.key(), -1);
-				if (placedNet < 0 || placedNet == candidateNet || placed.value() == nullptr)
-					continue;
-				if (holesShareBus(candidate.value(), placed.value()))
+				if (busOwner(busGroup) != -1)
 					return true;
+			}
+			else if (!busAvailableFor(busGroup, candidateNet))
+			{
+				return true;
 			}
 		}
 		return false;
@@ -1227,7 +1310,7 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 
 					QRectF movedBounds = part->sceneBoundingRect().translated(offset);
 					QRectF movedKeepout = movedBounds.adjusted(-PlacementKeepoutMargin, -PlacementKeepoutMargin, PlacementKeepoutMargin, PlacementKeepoutMargin);
-					if (!targetBoardBounds.contains(movedBounds))
+					if (!anyBoardContains(movedBounds))
 					{
 						rejectedOffBoard++;
 						continue;
@@ -1372,7 +1455,7 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 					QRectF movedBounds = partBounds.translated(offset);
 					QRectF movedKeepout = movedBounds.adjusted(-BendablePlacementKeepoutMargin, -BendablePlacementKeepoutMargin, BendablePlacementKeepoutMargin, BendablePlacementKeepoutMargin);
 
-					if (!targetBoardBounds.contains(movedBounds))
+					if (!anyBoardContains(movedBounds))
 					{
 						rejectedOffBoard++;
 						continue;
@@ -1537,6 +1620,10 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 			reservedHoles.insert(hole);
 			placedTargets.insert(pin, hole);
 			newlyPlacedTargets.insert(pin, hole);
+			// Claim the hole's bus for the pin's net (or exclusively, for a
+			// no-net pin) so later placements and routing cannot join it.
+			const int placedPinNet = netForConnector.value(pin, -1);
+			claimBus(busGroupFor(hole), placedPinNet >= 0 ? placedPinNet : makeNoNetOwnerKey());
 
 			QPolygonF newLeg = best.pinToLeg.value(pin);
 			if (!best.usesLegPlacement && pin->hasRubberBandLeg())
@@ -1739,13 +1826,14 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 			reservedHoles.insert(segment.to);
 		}
 	};
-	auto chooseEntry = [&](ConnectorItem *terminal, const QSet<ConnectorItem *> &extraReserved) {
+	auto chooseEntry = [&](ConnectorItem *terminal, const QSet<ConnectorItem *> &extraReserved, int ownerKey) {
 		ConnectorItem *best = nullptr;
 		double bestScore = std::numeric_limits<double>::max();
 		Q_FOREACH (ConnectorItem *hole, routeHoles)
 		{
 			if (hole == nullptr || reservedHoles.contains(hole) || extraReserved.contains(hole)) continue;
 			if (hole->connectionsCount() != 0) continue;
+			if (!busAvailableFor(busGroupFor(hole), ownerKey)) continue;
 			const double score = boardEdgeEntryScore(terminal, hole, holeBounds);
 			if (score < bestScore) {
 				best = hole;
@@ -1757,7 +1845,9 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 
 	logAutoroute(QString("ratsnest demands: %1").arg(demands.count()));
 	const RouteGraphSession routeSession = RouteGraphSession::build(
-		routeHoles, [this](ConnectorItem *connectorItem) { return busGroupFor(connectorItem); });
+		routeHoles,
+		[this](ConnectorItem *connectorItem) { return busGroupFor(connectorItem); },
+		[this](int busGroup) { return busOwner(busGroup); });
 	Q_FOREACH (Wire *demand, demands)
 	{
 		const int createdBeforeDemand = created;
@@ -1778,15 +1868,28 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 			continue;
 		}
 
+		// The demand's owner key: its schematic net, or a fresh exclusive
+		// sentinel if the endpoints are unexpectedly netless.
+		int demandNet = m_netForConnector.value(fromPart, INT_MIN);
+		if (demandNet == INT_MIN)
+			demandNet = m_netForConnector.value(toPart, INT_MIN);
+		if (demandNet == INT_MIN)
+			demandNet = makeNoNetOwnerKey();
+
 		if (fromHole != nullptr && toHole != nullptr)
 		{
-			const BreadboardRouteGraphCore::QueryContext routeContext = routeSession.prepare(reservedHoles, plannedSegments);
+			const BreadboardRouteGraphCore::QueryContext routeContext = routeSession.prepare(reservedHoles, plannedSegments, demandNet);
 			BreadboardRouteGraph::Result route = routeSession.route(fromHole, toHole, routeContext);
 			if (!route.found) {
 				failed++;
 				logAutoroute(QString("ratsnest demand failed: no board route from=[%1] to=[%2]")
 							 .arg(connectorSummary(fromPart), connectorSummary(toPart)));
 				continue;
+			}
+			Q_FOREACH (const BreadboardRouteGraph::Segment &segment, route.segments)
+			{
+				claimBus(busGroupFor(segment.from), demandNet);
+				claimBus(busGroupFor(segment.to), demandNet);
 			}
 			applyGraphRoute(route);
 			logAutoroute(QString("ratsnest demand complete: wires=%1").arg(created - createdBeforeDemand));
@@ -1795,8 +1898,10 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 
 		if (fromHole == nullptr && toHole == nullptr)
 		{
-			ConnectorItem *fromEntry = chooseEntry(fromPart, QSet<ConnectorItem *>());
+			ConnectorItem *fromEntry = chooseEntry(fromPart, QSet<ConnectorItem *>(), demandNet);
 			ConnectorItem *toEntry = nearestFreeBusHole(fromEntry);
+			if (toEntry != nullptr && !busAvailableFor(busGroupFor(toEntry), demandNet))
+				toEntry = nullptr;
 			if (fromEntry == nullptr || toEntry == nullptr) {
 				failed++;
 				logAutoroute("ratsnest demand failed: no entries for off-board pair");
@@ -1806,6 +1911,8 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 			addWire(toPart, toEntry);
 			reservedHoles.insert(fromEntry);
 			reservedHoles.insert(toEntry);
+			claimBus(busGroupFor(fromEntry), demandNet);
+			claimBus(busGroupFor(toEntry), demandNet);
 			logAutoroute(QString("ratsnest demand complete: wires=%1").arg(created - createdBeforeDemand));
 			continue;
 		}
@@ -1825,8 +1932,14 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 			logAutoroute(QString("ratsnest demand failed: no peripheral target [%1]").arg(connectorSummary(terminal)));
 			continue;
 		}
+		if (!busAvailableFor(busGroupFor(targetHole), demandNet)) {
+			failed++;
+			logAutoroute(QString("ratsnest demand failed: peripheral target bus owned by another net [%1]").arg(connectorSummary(targetHole)));
+			continue;
+		}
 		addWire(terminal, targetHole);
 		reservedHoles.insert(targetHole);
+		claimBus(busGroupFor(targetHole), demandNet);
 		logAutoroute(QString("ratsnest demand complete: wires=%1").arg(created - createdBeforeDemand));
 	}
 
@@ -1856,7 +1969,9 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 	QList<QLineF> plannedSegments;
 	QSet<int> failedNetIndices;
 	const RouteGraphSession netRouteSession = RouteGraphSession::build(
-		routeHoles, [this](ConnectorItem *connectorItem) { return busGroupFor(connectorItem); });
+		routeHoles,
+		[this](ConnectorItem *connectorItem) { return busGroupFor(connectorItem); },
+		[this](int busGroup) { return busOwner(busGroup); });
 	const BreadboardRouteGraph::Options activeOptions = BreadboardRouteGraph::Options::fromEnvironment();
 	logAutoroute(QString("route options: maxJumperLength=%1 candidatesPerBusPair=%2 crossingPenalty=%3 overlapPenalty=%4")
 				 .arg(activeOptions.maxJumperLength)
@@ -1989,6 +2104,8 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 						continue;
 					if (entry->connectionsCount() > 0)
 						continue;
+					if (!busAvailableFor(busGroupFor(entry), i))
+						continue;
 					const double score = boardEdgeEntryScore(terminal, entry, routeHoleBounds)
 					                   + leadCongestionPenalty(terminal, entry, entryLeadSegments);
 					if (score < bestEntryScore)
@@ -2034,7 +2151,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				{
 					ConnectorItem *targetEntry = terminalEntries.at(targetIndex);
 					BreadboardRouteGraph::Result bestRoute;
-					const BreadboardRouteGraphCore::QueryContext entryContext = netRouteSession.prepare(temporaryReserved, entryPlanningSegments);
+					const BreadboardRouteGraphCore::QueryContext entryContext = netRouteSession.prepare(temporaryReserved, entryPlanningSegments, i);
 					Q_FOREACH (ConnectorItem *connectedEntry, connectedEntries)
 					{
 						BreadboardRouteGraph::Result route = netRouteSession.route(connectedEntry, targetEntry, entryContext);
@@ -2082,6 +2199,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 					plannedSegments.append(peripheralLead);
 					peripheralLeadLength += peripheralLead.length();
 					routeReservedHoles.insert(target);
+					claimBus(busGroupFor(target), i);
 					created++;
 					wiredPeripheral++;
 				}
@@ -2095,6 +2213,8 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 						plannedSegments.append(connectorLine(segment.from, segment.to));
 						routeReservedHoles.insert(segment.from);
 						routeReservedHoles.insert(segment.to);
+						claimBus(busGroupFor(segment.from), i);
+						claimBus(busGroupFor(segment.to), i);
 						created++;
 					}
 				}
@@ -2113,7 +2233,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				BreadboardRouteGraph::Result bestRoute;
 				BreadboardRoutingScore bestBridgeScore;
 				bool haveBridgeScore = false;
-				const BreadboardRouteGraphCore::QueryContext bridgeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments);
+				const BreadboardRouteGraphCore::QueryContext bridgeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments, i);
 				// One Dijkstra per anchor; each of the ~holes entries below
 				// is then a constant-time extract instead of its own search.
 				QList<BreadboardRouteGraphCore::MultiResult> anchorRoutes;
@@ -2125,6 +2245,8 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 					if (entry == nullptr || routeReservedHoles.contains(entry) || usedBridgeTargets.contains(entry))
 						continue;
 					if (entry->connectionsCount() > 0)
+						continue;
+					if (!busAvailableFor(busGroupFor(entry), i))
 						continue;
 					const double entryScore = boardEdgeEntryScore(terminal, entry, routeHoleBounds)
 					                        + leadCongestionPenalty(terminal, entry, plannedSegments);
@@ -2177,6 +2299,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				peripheralLeadLength += peripheralLead.length();
 				usedBridgeTargets.insert(bestEntry);
 				routeReservedHoles.insert(bestEntry);
+				claimBus(busGroupFor(bestEntry), i);
 				created++;
 				wiredPeripheral++;
 
@@ -2188,6 +2311,8 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 					plannedSegments.append(connectorLine(segment.from, segment.to));
 					routeReservedHoles.insert(segment.from);
 					routeReservedHoles.insert(segment.to);
+					claimBus(busGroupFor(segment.from), i);
+					claimBus(busGroupFor(segment.to), i);
 					logAutoroute(QString("route bridge graph wire: net=%1 from=%2 to=%3 cost=%4")
 									 .arg(i)
 									 .arg(connectorSummary(segment.from))
@@ -2209,7 +2334,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 			BreadboardRoutingScore bestRoutingScore;
 			double bestTieBreak = std::numeric_limits<double>::max();
 			bool haveBestScore = false;
-			const BreadboardRouteGraphCore::QueryContext mergeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments);
+			const BreadboardRouteGraphCore::QueryContext mergeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments, i);
 
 			for (int fromSubnet = 0; fromSubnet < groups.count(); fromSubnet++)
 			{
@@ -2273,6 +2398,8 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				plannedSegments.append(connectorLine(segment.from, segment.to));
 				routeReservedHoles.insert(segment.from);
 				routeReservedHoles.insert(segment.to);
+				claimBus(busGroupFor(segment.from), i);
+				claimBus(busGroupFor(segment.to), i);
 				logAutoroute(QString("route graph wire: net=%1 from=%2 to=%3 cost=%4")
 								 .arg(i)
 								 .arg(connectorSummary(segment.from))
@@ -2466,6 +2593,135 @@ const QList<QPair<ConnectorItem *, ConnectorItem *> > &BreadboardAutorouter::nor
 	}
 	m_wireEndsCacheValid = true;
 	return m_normalBreadboardWireEnds;
+}
+
+int BreadboardAutorouter::busOwner(int busGroup) const
+{
+	return m_busOwnerForGroup.value(busGroup, -1);
+}
+
+bool BreadboardAutorouter::busAvailableFor(int busGroup, int ownerKey) const
+{
+	const int owner = busOwner(busGroup);
+	return owner == -1 || owner == ownerKey;
+}
+
+void BreadboardAutorouter::claimBus(int busGroup, int ownerKey)
+{
+	if (!m_busOwnerForGroup.contains(busGroup))
+		m_busOwnerForGroup.insert(busGroup, ownerKey);
+}
+
+int BreadboardAutorouter::makeNoNetOwnerKey()
+{
+	return m_nextNoNetOwnerKey--;
+}
+
+int BreadboardAutorouter::ownerKeyForPin(ConnectorItem *pin) const
+{
+	// Netted pins share their net's key; a no-net pin gets no shared key
+	// here - callers claim with a fresh sentinel so nothing may join it.
+	return m_netForConnector.value(pin, INT_MIN);
+}
+
+void BreadboardAutorouter::seedBusOwnership()
+{
+	m_busOwnerForGroup.clear();
+	m_nextNoNetOwnerKey = -2;
+	m_netForConnector.clear();
+	for (int netIndex = 0; netIndex < m_allPartConnectorItems.count(); netIndex++)
+	{
+		QList<ConnectorItem *> *net = m_allPartConnectorItems.at(netIndex);
+		if (net == nullptr)
+			continue;
+		Q_FOREACH (ConnectorItem *connectorItem, *net)
+		{
+			if (connectorItem == nullptr)
+				continue;
+			m_netForConnector.insert(connectorItem, netIndex);
+			// Only a real male PART pin actually plugged into a hole claims a
+			// bus at seed time. Female connectors are breadboard holes/sockets
+			// (they are net members but occupy nothing themselves), and
+			// connectedBreadboardHoleFor returns a female pin as itself - which
+			// would wrongly claim every hosting bus before placement even runs.
+			if (connectorItem->connectorType() == Connector::Female)
+				continue;
+			if (connectorItem->attachedToItemType() == ModelPart::Wire)
+				continue;
+			ConnectorItem *hole = connectedBreadboardHoleFor(connectorItem);
+			if (hole == nullptr || hole->connectorType() != Connector::Female)
+				continue;
+			const int busGroup = busGroupFor(hole);
+			const int owner = busOwner(busGroup);
+			if (owner == -1)
+				claimBus(busGroup, netIndex);
+			else if (owner != netIndex)
+				logAutoroute(QString("bus ownership seed conflict (pre-existing): bus=%1 owner=net%2 also touched by net%3 pin=%4")
+								 .arg(busGroup)
+								 .arg(owner)
+								 .arg(netIndex)
+								 .arg(connectorSummary(connectorItem)));
+		}
+	}
+
+	// Pins with no net already sitting in holes (pre-placed parts) claim
+	// their buses exclusively.
+	Q_FOREACH (QGraphicsItem *graphicsItem, m_sketchWidget->scene()->items())
+	{
+		auto *connectorItem = dynamic_cast<ConnectorItem *>(graphicsItem);
+		if (connectorItem == nullptr || connectorItem->attachedTo() == nullptr)
+			continue;
+		if (connectorItem->attachedTo()->getRatsnest() || !connectorItem->attachedTo()->isEverVisible())
+			continue;
+		if (connectorItem->connectorType() == Connector::Female)
+			continue;
+		if (connectorItem->attachedToItemType() == ModelPart::Wire)
+			continue;
+		if (m_netForConnector.contains(connectorItem))
+			continue;
+		ConnectorItem *hole = connectedBreadboardHoleFor(connectorItem);
+		if (hole == nullptr)
+			continue;
+		const int busGroup = busGroupFor(hole);
+		if (busOwner(busGroup) == -1)
+			claimBus(busGroup, makeNoNetOwnerKey());
+	}
+	logAutoroute(QString("bus ownership seeded: ownedBuses=%1 nettedPins=%2").arg(m_busOwnerForGroup.count()).arg(m_netForConnector.count()));
+}
+
+bool BreadboardAutorouter::verifySchematicConformance(QStringList &violations, bool recordBaseline)
+{
+	// Equal-potential walk per schematic net: the live connectivity graph
+	// must not reach any pin belonging to a different net. Pre-existing
+	// contacts (already present before this run) are exempt.
+	for (int netIndex = 0; netIndex < m_allPartConnectorItems.count(); netIndex++)
+	{
+		QList<ConnectorItem *> *net = m_allPartConnectorItems.at(netIndex);
+		if (net == nullptr || net->isEmpty())
+			continue;
+		QList<ConnectorItem *> equalPotential;
+		equalPotential.append(net->first());
+		ConnectorItem::collectEqualPotential(equalPotential, true, ViewGeometry::RatsnestFlag);
+		Q_FOREACH (ConnectorItem *reached, equalPotential)
+		{
+			const int reachedNet = m_netForConnector.value(reached, -1);
+			if (reachedNet < 0 || reachedNet == netIndex)
+				continue;
+			const QPair<int, int> contact(qMin(netIndex, reachedNet), qMax(netIndex, reachedNet));
+			if (recordBaseline)
+			{
+				m_preExistingNetContacts.insert(contact);
+				continue;
+			}
+			if (m_preExistingNetContacts.contains(contact))
+				continue;
+			violations.append(QObject::tr("net %1 is electrically connected to net %2 at %3 - this connection does not exist in the schematic")
+								  .arg(contact.first)
+								  .arg(contact.second)
+								  .arg(connectorSummary(reached)));
+		}
+	}
+	return violations.isEmpty();
 }
 
 void BreadboardAutorouter::invalidateRoutingCaches()

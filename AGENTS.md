@@ -242,3 +242,20 @@ Enforcement is dual:
 1. By construction - bus ownership model: every bus is FREE or owned by exactly one net; placement candidates, jumper landings, and route hops may only use buses they own or can claim. Schematic-breaking states become unrepresentable in the search space.
 2. By audit - mandatory post-route schematic conformance check (analogous to verifyPlacedConnections): recompute part-pin connectivity after routing and assert the connected-pin partition equals the schematic net partition (unrouted nets may remain split and are reported as failures; NOTHING may be merged). On violation: end macro, undo, report details, never ship the result silently.
 3. Boost tests at the kernel level (foreign pin mid-column must force detour/failure) plus the audit as end-to-end acceptance on fuzz.fzz and stress.fzz.
+
+## Bus-ownership invariant work (2026-07-12 evening, Opus 4.8)
+
+Implemented bus-ownership-by-construction toward the prime invariant. State:
+
+DONE + VERIFIED:
+- BreadboardRouteGraphCore gains busBlocked in QueryContext: a foreign-owned bus is never landed on or traversed (NO endpoint exemption). Boost test foreign_bus_is_never_touched added; 10/10 green (run-route-graph-tests.bat).
+- Ownership model in BreadboardAutorouter: busOwner/busAvailableFor/claimBus/makeNoNetOwnerKey; every bus is free(-1) or owned by a net index or a unique negative no-net sentinel. Placement conflictsWithPlacedNets rewritten to ownership (no-net pins claim exclusively - fixes unused-DIP-output transparency). Routing sessions build busBlocked from ownership keyed by the querying net; every applied route/entry/demand claims its buses.
+- Per-board containment: bodies must fit inside SOME single board rect (anyBoardContains), falling back to union when board rects unavailable. Kills inter-board-gap placement.
+- Add-a-board notification when residual ratsnests remain (honest wording, no false promise).
+- SEED BUG FIXED: seedBusOwnership iterated all net members incl. breadboard FEMALE holes; connectedBreadboardHoleFor returns a female pin as itself, so every hosting bus was claimed pre-placement (ownedBuses=34 = every mini-board column -> placement found no legal holes -> all 9 parts failed). Fix: seed only from real male part pins actually plugged into a female hole. Now ownedBuses=0 on fresh fuzz.
+- fuzz.fzz VERIFIED CLEAN: 9 placed, 0 failed, 5 jumpers, 228ms (faster than pre-invariant 503ms - ownership prunes candidates).
+
+NOT YET DONE (next):
+- CONFORMANCE AUDIT is LOG-ONLY: verifySchematicConformance uses collectEqualPotential(crossLayers=true) which walks into the SCHEMATIC netlist and reports ~nettedPins false contacts (fuzz 200, stress 1677). Must fix to a breadboard-only equal-potential walk (crossLayers=false, and/or restrict to breadboard-layer connectors) before re-enabling rollback. It is the belt-and-braces check for the prime invariant.
+- SCHEMATIC-SHORTS-GONE NOT VISUALLY CONFIRMED on stress: bus ownership SHOULD prevent the unused-M5450-output shorts by construction, but I have not captured the stress schematic to prove the spurious ratsnests are gone. USER TO EYEBALL or fix audit first.
+- stress still shows 6 residuals = LSM303C female-pin breakout (separate policy bug, already documented above). placeSearch still ~24s (Stage 1 grid pending).
