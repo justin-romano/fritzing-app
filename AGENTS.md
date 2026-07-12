@@ -231,3 +231,5 @@ Fix (FIRST ITEM next session, outranks all speed work):
 4. Verify on stress.fzz: schematic view shows ZERO new ratsnests after autoroute (this is the acceptance test - eyeball plus countUnresolvedNets-style scan of schematic-view ratsnest wires could automate it).
 
 Note: user's schematic file is not modified by routing; the dashes are live ratsnest overlays from the bad breadboard connections. Single Undo clears them.
+
+Related (same root, user-observed): the second breadboard on stress.fzz goes entirely unused. Scoring only rewards clustering (net affinity + centre pull + jumper penalty), so board 1 absorbs everything - which is exactly the crowding that produced the bus collisions. The bus-claim fix will make dense single-board placement infeasible; pair it with per-board bounds (already planned) and a spill rule so candidates on an emptier board stop being penalized once the busy board's free-bus supply tightens. Acceptance on stress.fzz: zero schematic ratsnests AND parts distributed across both boards when board 1 cannot legally hold them.
