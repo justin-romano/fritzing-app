@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Breadboard Router Prototype</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app">
+    <aside class="panel">
+      <h1>Breadboard Router Prototype</h1>
+      <div class="controls">
+        <button id="planButton" type="button">Plan</button>
+        <button id="placeButton" type="button">Place</button>
+        <button id="optimizeButton" type="button">Optimize</button>
+        <button id="resetButton" type="button">Reset</button>
+      </div>
+      <section>
+        <h2>Router Settings</h2>
+        <div id="routerSettings" class="settings-grid">
+          <label>
+            <span>Attempts</span>
+            <input type="number" data-setting="attempts" min="1" max="24" step="1" value="3">
+          </label>
+          <label>
+            <span>Iterations</span>
+            <input type="number" data-setting="iterations" min="20" max="3000" step="20" value="360">
+          </label>
+          <label>
+            <span>Max jumper holes</span>
+            <input type="number" data-setting="maxJumperHoles" min="2" max="30" step="1" value="10">
+          </label>
+          <label>
+            <span>Jumper penalty</span>
+            <input type="number" data-setting="jumperPenalty" min="0" max="5000" step="20" value="240">
+          </label>
+          <label>
+            <span>Crossing penalty</span>
+            <input type="number" data-setting="crossingPenalty" min="0" max="5000" step="20" value="700">
+          </label>
+          <label>
+            <span>Overlap penalty</span>
+            <input type="number" data-setting="overlapPenalty" min="0" max="8000" step="50" value="1200">
+          </label>
+          <label>
+            <span>Objective jumper</span>
+            <input type="number" data-setting="objectiveJumperPenalty" min="0" max="5000" step="20" value="180">
+          </label>
+          <label>
+            <span>Objective crossing</span>
+            <input type="number" data-setting="objectiveCrossingPenalty" min="0" max="5000" step="20" value="450">
+          </label>
+        </div>
+      </section>
+      <section>
+        <h2>Objective</h2>
+        <dl id="metrics" class="metrics"></dl>
+      </section>
+      <section>
+        <h2>Legend</h2>
+        <ul class="legend">
+          <li><span class="swatch board"></span> board-placeable</li>
+          <li><span class="swatch peripheral"></span> peripheral</li>
+          <li><span class="swatch wire"></span> jumper</li>
+          <li><span class="swatch rat"></span> unresolved net</li>
+        </ul>
+      </section>
+      <section>
+        <h2>Log</h2>
+        <pre id="log"></pre>
+      </section>
+      <section>
+        <h2>Validation</h2>
+        <pre id="validation"></pre>
+      </section>
+    </aside>
+    <section class="workspace">
+      <svg id="scene" viewBox="0 0 1520 760" role="img" aria-label="Breadboard routing prototype"></svg>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
