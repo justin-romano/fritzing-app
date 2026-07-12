@@ -17,6 +17,7 @@ HEADERS += \
 src/autoroute/autorouter.h \
 src/autoroute/breadboardautorouter.h \
 src/autoroute/breadboardpartpolicy.h \
+src/autoroute/breadboardplacementkernel.h \
 src/autoroute/breadboardroutegraph.h \
 src/autoroute/breadboardroutegraphcore.h \
 src/autoroute/breadboardroutingscore.h \
@@ -34,6 +35,7 @@ SOURCES += \
 src/autoroute/autorouter.cpp \
 src/autoroute/breadboardautorouter.cpp \
 src/autoroute/breadboardpartpolicy.cpp \
+src/autoroute/breadboardplacementkernel.cpp \
 src/autoroute/breadboardroutegraph.cpp \
 src/autoroute/breadboardroutegraphcore.cpp \
 src/autoroute/breadboardroutingscore.cpp \

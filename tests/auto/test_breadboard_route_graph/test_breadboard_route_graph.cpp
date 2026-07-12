@@ -2,6 +2,9 @@
 #include <boost/test/included/unit_test.hpp>
 
 #include "autoroute/breadboardroutegraphcore.h"
+#include "autoroute/breadboardplacementkernel.h"
+
+#include <algorithm>
 
 // Fixture: a tiny synthetic board. Three vertical 3-hole "column" buses at
 // x = 0, 30, 300 (bus 0, 1, 2), holes 9 apart vertically. Bus 2 is out of
@@ -29,6 +32,58 @@ struct TinyBoard
 	int hole(int bus, int row) const { return bus * 3 + row; }
 	QVector<bool> noneBlocked() const { return QVector<bool>(positions.count(), false); }
 };
+
+BOOST_AUTO_TEST_CASE(spatial_index_matches_brute_force_and_preserves_order)
+{
+	QVector<QPointF> positions;
+	QVector<int> boardIds;
+	for (int board = 0; board < 2; board++)
+	{
+		const double originX = board == 0 ? -45.0 : 200.0;
+		for (int y = 0; y < 8; y++)
+		{
+			for (int x = 0; x < 12; x++)
+			{
+				positions.append(QPointF(originX + x * 9.0, -27.0 + y * 9.0));
+				boardIds.append(board);
+			}
+		}
+	}
+
+	BreadboardPlacementKernel::HoleSpatialIndex index(positions, boardIds, 36.0);
+	const QPointF centers[] = {QPointF(-12.0, 0.0), QPointF(240.0, 18.0), QPointF(0.0, -27.0)};
+	const double radii[] = {0.0, 9.0, 40.5, 100.0};
+	for (const QPointF &center : centers)
+	{
+		for (double radius : radii)
+		{
+			for (int boardId = -1; boardId <= 1; boardId++)
+			{
+				QVector<int> expected;
+				for (int hole = 0; hole < positions.count(); hole++)
+				{
+					if (boardId >= 0 && boardIds.at(hole) != boardId)
+						continue;
+					if (QLineF(center, positions.at(hole)).length() <= radius)
+						expected.append(hole);
+				}
+				const QVector<int> actual = index.withinRadius(center, radius, boardId);
+				BOOST_CHECK_EQUAL_COLLECTIONS(actual.begin(), actual.end(), expected.begin(), expected.end());
+				BOOST_CHECK(std::is_sorted(actual.begin(), actual.end()));
+			}
+		}
+	}
+}
+
+BOOST_AUTO_TEST_CASE(spatial_index_includes_radius_boundary_and_handles_bad_board_vector)
+{
+	const QVector<QPointF> positions = {QPointF(0, 0), QPointF(3, 4), QPointF(6, 8), QPointF(-3, -4)};
+	BreadboardPlacementKernel::HoleSpatialIndex index(positions, {}, 3.0);
+	const QVector<int> actual = index.withinRadius(QPointF(0, 0), 5.0);
+	const QVector<int> expected = {0, 1, 3};
+	BOOST_CHECK_EQUAL_COLLECTIONS(actual.begin(), actual.end(), expected.begin(), expected.end());
+	BOOST_CHECK(index.withinRadius(QPointF(), -1.0).isEmpty());
+}
 
 BOOST_FIXTURE_TEST_CASE(same_bus_needs_no_jumper, TinyBoard)
 {
@@ -195,5 +250,4 @@ BOOST_AUTO_TEST_CASE(congestion_penalty_cases)
 						  candidate, {QLineF(QPointF(0, 20), QPointF(100, 20))}, crossing, overlap),
 					  1e-9);
 }
-
 

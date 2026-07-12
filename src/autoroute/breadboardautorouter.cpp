@@ -20,6 +20,7 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "breadboardautorouter.h"
 #include "breadboardpartpolicy.h"
+#include "breadboardplacementkernel.h"
 #include "breadboardroutegraph.h"
 #include "breadboardroutegraphcore.h"
 #include "breadboardtopology.h"
@@ -899,6 +900,7 @@ struct BreadboardAutorouter::PlacementPass
 	QHash<ConnectorItem *, int> boardIdForHole; // hole -> index into boardRects
 	QHash<ConnectorItem *, int> busIdForHole;
 	QHash<ConnectorItem *, QPointF> holePositions;
+	BreadboardPlacementKernel::HoleSpatialIndex holeSpatialIndex;
 	int targetSceneConnectors = 0;
 
 	// Mutable planning state, updated as each part is placed.
@@ -1046,9 +1048,16 @@ struct BreadboardAutorouter::PlacementPass
 									: breadboardCenter);
 
 		int busCount = 0;
+		QVector<QPointF> indexedPositions;
+		QVector<int> indexedBoardIds;
+		indexedPositions.reserve(breadboardHoles.count());
+		indexedBoardIds.reserve(breadboardHoles.count());
 		Q_FOREACH (ConnectorItem *hole, breadboardHoles)
 		{
-			holePositions.insert(hole, hole->sceneAdjustedTerminalPoint(nullptr));
+			const QPointF position = hole->sceneAdjustedTerminalPoint(nullptr);
+			holePositions.insert(hole, position);
+			indexedPositions.append(position);
+			indexedBoardIds.append(boardIdForHole.value(hole, -1));
 			if (busIdForHole.contains(hole))
 				continue;
 			const int busId = busCount++;
@@ -1060,6 +1069,9 @@ struct BreadboardAutorouter::PlacementPass
 			Q_FOREACH (ConnectorItem *sibling, busHoles)
 				busIdForHole.insert(sibling, busId);
 		}
+		// Four breadboard pitches per cell keeps each bucket compact while
+		// avoiding excessive cell traversal for normal bendable lead radii.
+		holeSpatialIndex = BreadboardPlacementKernel::HoleSpatialIndex(indexedPositions, indexedBoardIds, 36.0);
 	}
 
 	bool holesShareBus(ConnectorItem *first, ConnectorItem *second) const
@@ -1392,11 +1404,13 @@ struct BreadboardAutorouter::PlacementPass
 	{
 		ConnectorItem *nearestHole = nullptr;
 		double nearestDistance = HoleMatchTolerance;
-		Q_FOREACH (ConnectorItem *hole, breadboardHoles)
+		const QVector<int> nearbyHoleIndices = holeSpatialIndex.withinRadius(target, HoleMatchTolerance);
+		for (int holeIndex : nearbyHoleIndices)
 		{
+			ConnectorItem *hole = breadboardHoles.at(holeIndex);
 			if (reservedHoles.contains(hole) || candidateReserved.contains(hole))
 				continue;
-			double distance = QLineF(target, hole->sceneAdjustedTerminalPoint(nullptr)).length();
+			double distance = QLineF(target, holePositions.value(hole)).length();
 			if (distance <= nearestDistance)
 			{
 				nearestHole = hole;
@@ -1703,27 +1717,23 @@ struct BreadboardAutorouter::PlacementPass
 						  (candidate.secondPinPos.y() - candidate.firstPinPos.y()) / candidate.pinPairSpan)
 				: QPointF(1.0, 0.0);
 
-			Q_FOREACH (ConnectorItem *firstHole, breadboardHoles)
+			for (int firstHoleIndex = 0; firstHoleIndex < breadboardHoles.count(); firstHoleIndex++)
 			{
+				ConnectorItem *firstHole = breadboardHoles.at(firstHoleIndex);
 				if (reservedHoles.contains(firstHole))
 					continue;
 				candidate.firstHole = firstHole;
 				candidate.firstHolePos = holePositions.value(firstHole);
-				Q_FOREACH (ConnectorItem *secondHole, breadboardHoles)
+				const int boardId = boardIdForHole.value(firstHole, -1);
+				const QVector<int> nearbyHoleIndices = holeSpatialIndex.withinRadius(candidate.firstHolePos, maxHoleSpan, boardId);
+				for (int secondHoleIndex : nearbyHoleIndices)
 				{
+					ConnectorItem *secondHole = breadboardHoles.at(secondHoleIndex);
 					if (firstHole == secondHole)
 						continue;
 					if (reservedHoles.contains(secondHole))
 						continue;
 					candidateAttempts++;
-
-					// Legs may not straddle two boards; a hole pair is only
-					// valid within one board.
-					if (boardIdForHole.value(firstHole, -1) != boardIdForHole.value(secondHole, -2))
-					{
-						rejectedPinGeometry++;
-						continue;
-					}
 
 					candidate.secondHole = secondHole;
 					candidate.secondHolePos = holePositions.value(secondHole);
