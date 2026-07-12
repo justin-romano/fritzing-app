@@ -71,6 +71,7 @@ private:
 	QString itemSummary(ItemBase * itemBase) const;
 	QString logFilePath() const;
 	void logAutoroute(const QString & message) const;
+	void flushAutorouteLog() const;
 	ConnectorItem * connectedPartConnector(ConnectorItem * wireConnector) const;
 	ConnectorItem * connectedBreadboardHoleFor(ConnectorItem * partConnector) const;
 	ConnectorItem * breadboardHoleFor(ConnectorItem * partConnector) const;
@@ -118,6 +119,9 @@ private:
 	// whenever pushed commands change scene wires.
 	mutable QHash<ConnectorItem *, int> m_busGroupForConnector;
 	mutable int m_busGroupCount = 0;
+	// Log lines are buffered and flushed at phase boundaries: opening and
+	// closing the file per line dominated route-search time on large boards.
+	mutable QStringList m_logBuffer;
 	mutable bool m_wireEndsCacheValid = false;
 	mutable QList<QPair<ConnectorItem *, ConnectorItem *> > m_normalBreadboardWireEnds;
 

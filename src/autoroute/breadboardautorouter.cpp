@@ -347,6 +347,8 @@ void BreadboardAutorouter::start()
 				 .arg(m_jumperPenalty)
 				 .arg(m_leadAngleWeight)
 				 .arg(m_foldbackWeight));
+	// Flush immediately so external watchers see the log recreated at start.
+	flushAutorouteLog();
 
 	auto *undoStack = m_sketchWidget->undoStack();
 	const int undoCountBefore = undoStack->count();
@@ -379,6 +381,7 @@ void BreadboardAutorouter::start()
 	{
 		undoStack->endMacro();
 		logAutoroute("abort: no breadboard connections to route");
+		flushAutorouteLog();
 		QMessageBox::information(nullptr, QObject::tr("Fritzing"), QObject::tr("No breadboard connections to route."));
 		return;
 	}
@@ -402,6 +405,7 @@ void BreadboardAutorouter::start()
 		undoStack->endMacro();
 		undoStack->undo();
 		logAutoroute("abort: placement connection verification failed; transaction rolled back");
+		flushAutorouteLog();
 		QMessageBox messageBox(QMessageBox::Critical,
 							   QObject::tr("Fritzing"),
 							   QObject::tr("Breadboard placement produced detached component pins and was rolled back."));
@@ -440,6 +444,7 @@ void BreadboardAutorouter::start()
 		logAutoroute("abort: no valid placement or route");
 		if (!m_lastPlacementReport.isEmpty())
 			logAutoroute(QString("placement report:\n%1").arg(m_lastPlacementReport));
+		flushAutorouteLog();
 		QMessageBox messageBox(QMessageBox::Information,
 							   QObject::tr("Fritzing"),
 							   QObject::tr("Breadboard autoroute did not find a valid placement or route."));
@@ -536,6 +541,7 @@ void BreadboardAutorouter::start()
 						 .arg(points.join(" ")));
 	}
 	logAutoroute("========== breadboard autoroute end ==========");
+	flushAutorouteLog();
 }
 
 int BreadboardAutorouter::clearPreviousAutorouteWires()
@@ -2380,12 +2386,25 @@ QString BreadboardAutorouter::logFilePath() const
 
 void BreadboardAutorouter::logAutoroute(const QString &message) const
 {
+	m_logBuffer.append(QDateTime::currentDateTime().toString(Qt::ISODateWithMs) + " " + message);
+	// Cap memory without losing the tail on a crash mid-phase.
+	if (m_logBuffer.count() >= 512)
+		flushAutorouteLog();
+}
+
+void BreadboardAutorouter::flushAutorouteLog() const
+{
+	if (m_logBuffer.isEmpty())
+		return;
+
 	QFile file(logFilePath());
 	if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
 		return;
 
 	QTextStream stream(&file);
-	stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " " << message << '\n';
+	Q_FOREACH (const QString &line, m_logBuffer)
+		stream << line << '\n';
+	m_logBuffer.clear();
 }
 
 ConnectorItem *BreadboardAutorouter::connectedPartConnector(ConnectorItem *wireConnector) const
