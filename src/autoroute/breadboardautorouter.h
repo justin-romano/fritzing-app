@@ -22,6 +22,7 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 #define BREADBOARDAUTOROUTER_H
 
 #include <QObject>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QList>
 #include <QPair>
@@ -107,6 +108,7 @@ private:
 	int countUnresolvedNets() const;
 	void clearCollectedNets();
 	void sortCollectedNets();
+	void reportProgress(int percent, const QString & detail);
 	void loadTuning();
 
 	// Wall-clock per pipeline phase, reset each start(); logged as one
@@ -149,6 +151,7 @@ private:
 	// Log lines are buffered and flushed at phase boundaries: opening and
 	// closing the file per line dominated route-search time on large boards.
 	mutable QStringList m_logBuffer;
+	QElapsedTimer m_progressPumpTimer;
 	mutable bool m_wireEndsCacheValid = false;
 	mutable QList<QPair<ConnectorItem *, ConnectorItem *> > m_normalBreadboardWireEnds;
 

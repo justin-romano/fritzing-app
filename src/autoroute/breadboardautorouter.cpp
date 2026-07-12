@@ -48,6 +48,7 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 #include "../commands.h"
 #include "../items/itembase.h"
 #include "../items/wire.h"
+#include "../processeventblocker.h"
 #include "../sketch/breadboardsketchwidget.h"
 #include "../waitpushundostack.h"
 
@@ -94,6 +95,11 @@ namespace
 	};
 
 	constexpr double FlipRotationDegrees = 180.0;
+
+	// Progress is reported as a weighted percentage: placement dominates
+	// wall-clock on real sketches, routing search is comparatively quick.
+	constexpr int PlacementProgressSpan = 70;
+	constexpr int RoutingProgressEnd = 95;
 
 	constexpr double HoleMatchTolerance = 12.0;
 	constexpr double PlacementKeepoutMargin = 8.0;
@@ -551,10 +557,11 @@ void BreadboardAutorouter::start()
 		return;
 	}
 
-	Q_EMIT setMaximumProgress(m_allPartConnectorItems.count());
+	Q_EMIT setMaximumProgress(100);
 	Q_EMIT setProgressValue(0);
 	Q_EMIT setProgressMessage(QObject::tr("Placing breadboard parts..."));
 	Q_EMIT setProgressMessage2(QString());
+	m_progressPumpTimer.start();
 
 	// Prime invariant machinery: seed bus ownership from existing
 	// connections and record net contacts that already exist so the
@@ -597,7 +604,6 @@ void BreadboardAutorouter::start()
 		m_sketchWidget->collectAllNets(indexer, m_allPartConnectorItems, false, false, false);
 		sortCollectedNets();
 		logAutoroute(QString("collectAllNets after placement: nets=%1 indexer=%2").arg(m_allPartConnectorItems.count()).arg(indexer.count()));
-		Q_EMIT setMaximumProgress(m_allPartConnectorItems.count());
 
 		// Placement merges equal-potential groups (pins now share buses), so
 		// this collection numbers nets differently from the one that seeded
@@ -624,7 +630,7 @@ void BreadboardAutorouter::start()
 	m_phaseStats.routeSearchMs = takePhaseMs();
 	logAutoroute(QString("route complete: createdWires=%1").arg(created));
 
-	Q_EMIT setProgressValue(m_allPartConnectorItems.count());
+	Q_EMIT setProgressValue(RoutingProgressEnd);
 
 	if (placed <= 0 && created <= 0)
 	{
@@ -770,6 +776,7 @@ void BreadboardAutorouter::start()
 						 .arg(leg.count())
 						 .arg(points.join(" ")));
 	}
+	Q_EMIT setProgressValue(100);
 	logAutoroute("========== breadboard autoroute end ==========");
 	flushAutorouteLog();
 }
@@ -888,6 +895,8 @@ struct BreadboardAutorouter::PlacementPass
 	QRectF targetBoardBounds;
 	QVector<QRectF> boardRects;
 	QPointF breadboardCenter;
+	QVector<QPointF> boardCenters;              // per-board hole centroid
+	QHash<ConnectorItem *, int> boardIdForHole; // hole -> index into boardRects
 	QHash<ConnectorItem *, int> busIdForHole;
 	QHash<ConnectorItem *, QPointF> holePositions;
 	int targetSceneConnectors = 0;
@@ -970,7 +979,12 @@ struct BreadboardAutorouter::PlacementPass
 		// Union bounds cover the empty gap BETWEEN boards on multi-board
 		// sketches; a body is only legal fully inside some single board.
 		Q_FOREACH (const BreadboardTopology::Board &board, topology.boards())
+		{
+			const int boardId = boardRects.count();
 			boardRects.append(board.bounds);
+			Q_FOREACH (ConnectorItem *hole, board.holes)
+				boardIdForHole.insert(hole, boardId);
+		}
 		Q_FOREACH (const QRectF &boardRect, boardRects)
 			self->logAutoroute(QString("board rect: (%1,%2)-(%3,%4)")
 							   .arg(boardRect.left()).arg(boardRect.top())
@@ -1012,6 +1026,24 @@ struct BreadboardAutorouter::PlacementPass
 			breadboardCenter += hole->sceneAdjustedTerminalPoint(nullptr);
 		}
 		breadboardCenter /= breadboardHoles.count();
+
+		// Per-board hole centroids, accumulated in the same sorted hole order
+		// as breadboardCenter so a single-board sketch computes bitwise the
+		// same centre it did before multi-board support.
+		QVector<QPointF> boardSums(boardRects.count(), QPointF());
+		QVector<int> boardHoleCounts(boardRects.count(), 0);
+		Q_FOREACH (ConnectorItem *hole, breadboardHoles)
+		{
+			const int boardId = boardIdForHole.value(hole, -1);
+			if (boardId < 0 || boardId >= boardSums.count())
+				continue;
+			boardSums[boardId] += hole->sceneAdjustedTerminalPoint(nullptr);
+			boardHoleCounts[boardId]++;
+		}
+		for (int boardId = 0; boardId < boardSums.count(); boardId++)
+			boardCenters.append(boardHoleCounts.at(boardId) > 0
+									? boardSums.at(boardId) / boardHoleCounts.at(boardId)
+									: breadboardCenter);
 
 		int busCount = 0;
 		Q_FOREACH (ConnectorItem *hole, breadboardHoles)
@@ -1057,6 +1089,35 @@ struct BreadboardAutorouter::PlacementPass
 				return true;
 		}
 		return false;
+	}
+
+	// Pull candidates toward the nearest board's own hole centroid: the mean
+	// of ALL holes sits in the empty gap between boards on multi-board
+	// sketches and would drag every part there.
+	double distanceToNearestBoardCenter(const QPointF &point) const
+	{
+		if (boardCenters.isEmpty())
+			return manhattanDistance(point, breadboardCenter);
+		double best = std::numeric_limits<double>::max();
+		Q_FOREACH (const QPointF &center, boardCenters)
+			best = qMin(best, manhattanDistance(point, center));
+		return best;
+	}
+
+	// A part body cannot span two boards: every mapped hole must belong to
+	// the same board.
+	bool mappedHolesShareBoard(const QHash<ConnectorItem *, ConnectorItem *> &pinToHole) const
+	{
+		int sharedBoardId = -2;
+		for (auto it = pinToHole.constBegin(); it != pinToHole.constEnd(); ++it)
+		{
+			const int holeBoardId = boardIdForHole.value(it.value(), -1);
+			if (sharedBoardId == -2)
+				sharedBoardId = holeBoardId;
+			if (holeBoardId != sharedBoardId)
+				return false;
+		}
+		return true;
 	}
 
 	// A part with any placeable pin already seated in a female socket was
@@ -1320,7 +1381,7 @@ struct BreadboardAutorouter::PlacementPass
 		}
 
 		if (!hasPlacedTarget)
-			return manhattanDistance(targetPos, breadboardCenter) * 0.05;
+			return distanceToNearestBoardCenter(targetPos) * 0.05;
 		if (sharesPlacedBus)
 			return bestDistance * 0.01;
 		return self->m_jumperPenalty + bestDistance;
@@ -1381,6 +1442,11 @@ struct BreadboardAutorouter::PlacementPass
 			pinToHole.insert(pin, nearestHole);
 		}
 
+		if (!mappedHolesShareBoard(pinToHole))
+		{
+			rejectedPinGeometry++;
+			return;
+		}
 		if (anyMappedPairSharesBus(pinToHole))
 		{
 			rejectedSameBus++;
@@ -1405,7 +1471,7 @@ struct BreadboardAutorouter::PlacementPass
 		}
 
 		acceptedCandidates++;
-		double score = manhattanDistance(movedBounds.center(), breadboardCenter) * 0.15;
+		double score = distanceToNearestBoardCenter(movedBounds.center()) * 0.15;
 		Q_FOREACH (ConnectorItem *pin, pins)
 			score += netPlacementCost(pin, pinToHole.value(pin, nullptr));
 		if (score >= best.score)
@@ -1503,7 +1569,7 @@ struct BreadboardAutorouter::PlacementPass
 		}
 
 		acceptedCandidates++;
-		double score = manhattanDistance(movedBounds.center(), breadboardCenter) * 0.15
+		double score = distanceToNearestBoardCenter(movedBounds.center()) * 0.15
 					 + (firstLegLength + secondLegLength) * self->m_leadLengthWeight;
 
 		// Straight leads only look straight when they leave along the body
@@ -1650,6 +1716,14 @@ struct BreadboardAutorouter::PlacementPass
 					if (reservedHoles.contains(secondHole))
 						continue;
 					candidateAttempts++;
+
+					// Legs may not straddle two boards; a hole pair is only
+					// valid within one board.
+					if (boardIdForHole.value(firstHole, -1) != boardIdForHole.value(secondHole, -2))
+					{
+						rejectedPinGeometry++;
+						continue;
+					}
 
 					candidate.secondHole = secondHole;
 					candidate.secondHolePos = holePositions.value(secondHole);
@@ -1950,9 +2024,17 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 	pass.collectOccupiedRects();
 	pass.sortByConnectivity();
 	pass.beginCommand();
+	const int movableCount = pass.movableParts.count();
+	int partsDone = 0;
 	Q_FOREACH (ItemBase *part, pass.movableParts)
 	{
+		reportProgress(movableCount > 0 ? (PlacementProgressSpan * partsDone) / movableCount : 0,
+					   QObject::tr("Placing %1 (%2 of %3)...")
+						   .arg(part == nullptr ? QString() : part->title())
+						   .arg(partsDone + 1)
+						   .arg(movableCount));
 		pass.placePart(part);
+		partsDone++;
 	}
 	return pass.finish();
 }
@@ -2709,7 +2791,9 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 
 	for (int orderIndex = 0; orderIndex < routeOrder.count(); orderIndex++)
 	{
-		Q_EMIT setProgressValue(orderIndex);
+		reportProgress(PlacementProgressSpan
+						   + ((RoutingProgressEnd - PlacementProgressSpan) * orderIndex) / qMax(1, routeOrder.count()),
+					   QObject::tr("Routing net %1 of %2...").arg(orderIndex + 1).arg(routeOrder.count()));
 		const int netIndex = routeOrder.at(orderIndex);
 		QList<ConnectorItem *> *net = m_allPartConnectorItems.at(netIndex);
 		if (net == nullptr)
@@ -3451,6 +3535,21 @@ void BreadboardAutorouter::clearCollectedNets()
 {
 	qDeleteAll(m_allPartConnectorItems);
 	m_allPartConnectorItems.clear();
+}
+
+// Update the progress dialog and (rate-limited) let it repaint. The router
+// runs synchronously on the GUI thread, so nothing paints unless events are
+// pumped - but pumping unconditionally per part or per net would thrash the
+// GUI engine with repaints. ~5 pumps per second keeps the bar live for free.
+void BreadboardAutorouter::reportProgress(int percent, const QString &detail)
+{
+	Q_EMIT setProgressValue(percent);
+	if (!detail.isEmpty())
+		Q_EMIT setProgressMessage2(detail);
+	if (m_progressPumpTimer.isValid() && m_progressPumpTimer.elapsed() < 200)
+		return;
+	m_progressPumpTimer.restart();
+	ProcessEventBlocker::processEvents();
 }
 
 // collectAllNets walks hash-ordered structures, so both net order and member
