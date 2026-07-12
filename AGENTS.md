@@ -259,3 +259,25 @@ NOT YET DONE (next):
 - CONFORMANCE AUDIT is LOG-ONLY: verifySchematicConformance uses collectEqualPotential(crossLayers=true) which walks into the SCHEMATIC netlist and reports ~nettedPins false contacts (fuzz 200, stress 1677). Must fix to a breadboard-only equal-potential walk (crossLayers=false, and/or restrict to breadboard-layer connectors) before re-enabling rollback. It is the belt-and-braces check for the prime invariant.
 - SCHEMATIC-SHORTS-GONE NOT VISUALLY CONFIRMED on stress: bus ownership SHOULD prevent the unused-M5450-output shorts by construction, but I have not captured the stress schematic to prove the spurious ratsnests are gone. USER TO EYEBALL or fix audit first.
 - stress still shows 6 residuals = LSM303C female-pin breakout (separate policy bug, already documented above). placeSearch still ~24s (Stage 1 grid pending).
+
+## Conformance audit CORRECTED + prime invariant VERIFIED (2026-07-12 late, Opus 4.8)
+
+verifySchematicConformance rewritten as a breadboard-only bus union-find short
+detector: union bus groups joined by real breadboard wires (component bodies
+are not wires, so intended netlist connections are not unioned), then assert no
+component carries two different owners (schematic net indices or per-no-net-pin
+sentinels). No cross-layer walk, so it cannot mistake the schematic netlist for
+a short. Two bugs fixed en route: (a) crossLayers=true walked the schematic
+netlist -> ~nettedPins false contacts; (b) m_netForConnector holds female
+breadboard holes (net members occupying nothing) which produced phantom shorts
+- audit now filters to real male part pins only.
+
+VERIFIED: audit reports 0 on valid fuzz (no false positives) AND 0 on stress
+(the M5450 unused-output shorts are eliminated by bus-ownership construction).
+Rollback RE-ENABLED: any real short ends the macro, undoes, and reports. fuzz
+228ms, 0 failed, conformance verified. stress: 19 placed, 0 shorts, 6 residuals
+(= LSM303C female-pin breakout, still the separate open policy issue).
+
+PRIME INVARIANT now holds by construction AND is independently audited. Remaining
+open items unchanged: LSM303C female-pin policy (6 residuals), board-spill onto
+2nd board, placement spatial grid (~24s), then Stage 2 threading.

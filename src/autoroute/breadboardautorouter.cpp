@@ -657,14 +657,29 @@ void BreadboardAutorouter::start()
 	// PRIME INVARIANT audit: the routed result must not connect nets that
 	// the schematic keeps separate. Any violation is our bug - roll the
 	// entire autoroute back rather than ship a wrong circuit.
-	// NOTE: the equal-potential audit currently over-collects (crossLayers
-	// walks into the schematic netlist), so it is LOG-ONLY until corrected.
-	// The primary guarantee is bus-ownership-by-construction; this line is a
-	// diagnostic whose count we compare against the visual result.
+	// PRIME INVARIANT audit: bus-ownership prevents shorts by construction;
+	// this is the independent belt-and-braces check (breadboard-only bus
+	// union-find, verified to report 0 on valid routes). Any violation is
+	// our bug - roll the whole autoroute back rather than ship a wrong
+	// circuit.
 	{
 		QStringList violations;
-		verifySchematicConformance(violations);
-		logAutoroute(QString("schematic conformance (log-only): %1 reported contacts").arg(violations.count()));
+		if (!verifySchematicConformance(violations))
+		{
+			logAutoroute(QString("SCHEMATIC CONFORMANCE FAILED (%1 shorts):\n%2")
+							 .arg(violations.count())
+							 .arg(violations.join('\n')));
+			undoStack->endMacro();
+			undoStack->undo();
+			flushAutorouteLog();
+			QMessageBox messageBox(QMessageBox::Critical,
+								   QObject::tr("Fritzing"),
+								   QObject::tr("Autoroute created connections that do not exist in the schematic and was rolled back."));
+			messageBox.setDetailedText(violations.join('\n'));
+			messageBox.exec();
+			return;
+		}
+		logAutoroute("schematic conformance verified: no breadboard shorts between schematic nets");
 	}
 
 	logAutoroute(QString("undo transaction after routing: count=%1 index=%2")
@@ -2691,34 +2706,107 @@ void BreadboardAutorouter::seedBusOwnership()
 
 bool BreadboardAutorouter::verifySchematicConformance(QStringList &violations, bool recordBaseline)
 {
-	// Equal-potential walk per schematic net: the live connectivity graph
-	// must not reach any pin belonging to a different net. Pre-existing
-	// contacts (already present before this run) are exempt.
-	for (int netIndex = 0; netIndex < m_allPartConnectorItems.count(); netIndex++)
+	// Independent short detector, breadboard-view only. Union bus groups
+	// that are joined by real breadboard wires, then assert no resulting
+	// component carries pins from two different owners (schematic nets, or a
+	// no-net pin such as an unused DIP output). Deliberately does NOT walk
+	// cross-layer, so it can never mistake the schematic netlist itself for
+	// a short. Pre-existing owner contacts are exempt.
+
+	// Owner key per part pin: its schematic net index, or a unique negative
+	// id for a no-net pin (each no-net pin is its own singleton owner - it
+	// must never share a component with any other owner). Only real MALE
+	// part pins count: m_netForConnector also holds female breadboard holes
+	// (net members that occupy nothing), which would produce phantom shorts.
+	QHash<ConnectorItem *, int> ownerForPin;
+	for (auto it = m_netForConnector.constBegin(); it != m_netForConnector.constEnd(); ++it)
 	{
-		QList<ConnectorItem *> *net = m_allPartConnectorItems.at(netIndex);
-		if (net == nullptr || net->isEmpty())
+		ConnectorItem *pin = it.key();
+		if (pin == nullptr || pin->connectorType() == Connector::Female)
 			continue;
-		QList<ConnectorItem *> equalPotential;
-		equalPotential.append(net->first());
-		ConnectorItem::collectEqualPotential(equalPotential, true, ViewGeometry::RatsnestFlag);
-		Q_FOREACH (ConnectorItem *reached, equalPotential)
+		if (pin->attachedToItemType() == ModelPart::Wire)
+			continue;
+		ownerForPin.insert(pin, it.value());
+	}
+	int nextNoNetId = -2;
+	Q_FOREACH (QGraphicsItem *graphicsItem, m_sketchWidget->scene()->items())
+	{
+		auto *pin = dynamic_cast<ConnectorItem *>(graphicsItem);
+		if (pin == nullptr || pin->attachedTo() == nullptr)
+			continue;
+		if (pin->attachedTo()->getRatsnest() || !pin->attachedTo()->isEverVisible())
+			continue;
+		if (pin->connectorType() == Connector::Female || pin->attachedToItemType() == ModelPart::Wire)
+			continue;
+		if (ownerForPin.contains(pin))
+			continue;
+		if (connectedBreadboardHoleFor(pin) != nullptr)
+			ownerForPin.insert(pin, nextNoNetId--);
+	}
+
+	// Union-find over bus groups.
+	QHash<int, int> parent;
+	std::function<int(int)> findRoot = [&](int value) {
+		int root = value;
+		while (parent.value(root, root) != root) root = parent.value(root, root);
+		while (parent.value(value, value) != value) {
+			const int next = parent.value(value, value);
+			parent[value] = root;
+			value = next;
+		}
+		return root;
+	};
+	auto unite = [&](int first, int second) {
+		const int firstRoot = findRoot(first);
+		const int secondRoot = findRoot(second);
+		if (firstRoot != secondRoot) parent[firstRoot] = secondRoot;
+	};
+
+	// Join buses connected by breadboard wires. Component bodies are NOT
+	// wires, so intended part-to-part netlist connections are not unioned -
+	// only breadboard copper is.
+	using WireEnds = QPair<ConnectorItem *, ConnectorItem *>;
+	Q_FOREACH (const WireEnds &ends, normalBreadboardWireEnds())
+	{
+		ConnectorItem *fromHole = connectedBreadboardHoleFor(ends.first);
+		ConnectorItem *toHole = connectedBreadboardHoleFor(ends.second);
+		if (fromHole == nullptr || toHole == nullptr)
+			continue;
+		unite(busGroupFor(fromHole), busGroupFor(toHole));
+	}
+
+	// Collect the distinct owners on each component.
+	QHash<int, QList<QPair<int, ConnectorItem *> > > ownersByComponent;
+	for (auto it = ownerForPin.constBegin(); it != ownerForPin.constEnd(); ++it)
+	{
+		ConnectorItem *hole = connectedBreadboardHoleFor(it.key());
+		if (hole == nullptr)
+			continue;
+		ownersByComponent[findRoot(busGroupFor(hole))].append(qMakePair(it.value(), it.key()));
+	}
+
+	for (auto it = ownersByComponent.constBegin(); it != ownersByComponent.constEnd(); ++it)
+	{
+		const QList<QPair<int, ConnectorItem *> > &pins = it.value();
+		for (int a = 0; a < pins.count(); a++)
 		{
-			const int reachedNet = m_netForConnector.value(reached, -1);
-			if (reachedNet < 0 || reachedNet == netIndex)
-				continue;
-			const QPair<int, int> contact(qMin(netIndex, reachedNet), qMax(netIndex, reachedNet));
-			if (recordBaseline)
+			for (int b = a + 1; b < pins.count(); b++)
 			{
-				m_preExistingNetContacts.insert(contact);
-				continue;
+				if (pins.at(a).first == pins.at(b).first)
+					continue;
+				const QPair<int, int> contact(qMin(pins.at(a).first, pins.at(b).first),
+											  qMax(pins.at(a).first, pins.at(b).first));
+				if (recordBaseline)
+				{
+					m_preExistingNetContacts.insert(contact);
+					continue;
+				}
+				if (m_preExistingNetContacts.contains(contact))
+					continue;
+				violations.append(QObject::tr("%1 and %2 are joined by breadboard wiring but belong to different schematic nets")
+									  .arg(connectorSummary(pins.at(a).second))
+									  .arg(connectorSummary(pins.at(b).second)));
 			}
-			if (m_preExistingNetContacts.contains(contact))
-				continue;
-			violations.append(QObject::tr("net %1 is electrically connected to net %2 at %3 - this connection does not exist in the schematic")
-								  .arg(contact.first)
-								  .arg(contact.second)
-								  .arg(connectorSummary(reached)));
 		}
 	}
 	return violations.isEmpty();
