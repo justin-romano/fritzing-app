@@ -21,7 +21,11 @@ along with Fritzing.  If not, see <http://www.gnu.org/licenses/>.
 #include "breadboardautorouter.h"
 #include "breadboardpartpolicy.h"
 #include "breadboardroutegraph.h"
+#include "breadboardroutegraphcore.h"
 #include "breadboardtopology.h"
+
+#include <functional>
+#include <memory>
 
 #include <QHash>
 #include <QDateTime>
@@ -105,12 +109,107 @@ namespace
 		return QLineF(from->sceneAdjustedTerminalPoint(nullptr), to->sceneAdjustedTerminalPoint(nullptr));
 	}
 
-	BreadboardRouteGraph::Options routeGraphOptions(const QList<QLineF> &plannedSegments)
+	BreadboardRouteGraphCore::Options coreRouteOptions()
 	{
-		BreadboardRouteGraph::Options options = BreadboardRouteGraph::Options::fromEnvironment();
-		options.existingSegments = plannedSegments;
+		const BreadboardRouteGraph::Options env = BreadboardRouteGraph::Options::fromEnvironment();
+		BreadboardRouteGraphCore::Options options;
+		options.maxJumperLength = env.maxJumperLength;
+		options.jumperPenalty = env.jumperPenalty;
+		options.crossingPenalty = env.crossingPenalty;
+		options.overlapPenalty = env.overlapPenalty;
+		options.candidatesPerBusPair = env.candidatesPerBusPair;
 		return options;
 	}
+
+	// Builds the static bus graph ONCE per routing pass. Everything that
+	// changes as routing proceeds - reserved holes and planned segments -
+	// is supplied per route() query. Results are mapped back to the old
+	// ConnectorItem-based Result so call sites stay unchanged.
+	struct RouteGraphSession
+	{
+		QList<ConnectorItem *> holes;
+		QHash<ConnectorItem *, int> indexForHole;
+		QVector<bool> baseBlocked;
+		std::shared_ptr<BreadboardRouteGraphCore> core;
+
+		static RouteGraphSession build(const QList<ConnectorItem *> &routeHoles,
+									   const std::function<int(ConnectorItem *)> &busGroup)
+		{
+			RouteGraphSession session;
+			session.holes = routeHoles;
+			QVector<QPointF> positions(routeHoles.count());
+			QVector<int> busIds(routeHoles.count(), -1);
+			session.baseBlocked = QVector<bool>(routeHoles.count(), false);
+			QHash<int, int> denseBusFor;
+			for (int i = 0; i < routeHoles.count(); i++)
+			{
+				ConnectorItem *hole = routeHoles.at(i);
+				if (hole == nullptr)
+					continue;
+				session.indexForHole.insert(hole, i);
+				positions[i] = hole->sceneAdjustedTerminalPoint(nullptr);
+				const int group = busGroup(hole);
+				auto found = denseBusFor.constFind(group);
+				if (found == denseBusFor.constEnd())
+				{
+					busIds[i] = denseBusFor.count();
+					denseBusFor.insert(group, busIds[i]);
+				}
+				else
+				{
+					busIds[i] = found.value();
+				}
+				// Occupancy is stable during a pass: wire commands only
+				// execute at push, after routing has finished.
+				session.baseBlocked[i] = hole->connectionsCount() != 0;
+			}
+			session.core = std::make_shared<BreadboardRouteGraphCore>(positions, busIds, coreRouteOptions());
+			return session;
+		}
+
+		// Build once per batch of route() calls sharing the same reserved
+		// set and planned segments - this replaces the old per-batch graph
+		// reconstruction at a fraction of its cost.
+		BreadboardRouteGraphCore::QueryContext prepare(const QSet<ConnectorItem *> &reserved,
+													   const QList<QLineF> &plannedSegments) const
+		{
+			QVector<bool> blocked = baseBlocked;
+			Q_FOREACH (ConnectorItem *hole, reserved)
+			{
+				const int index = indexForHole.value(hole, -1);
+				if (index >= 0)
+					blocked[index] = true;
+			}
+			return core->prepareQuery(blocked, plannedSegments);
+		}
+
+		BreadboardRouteGraph::Result route(ConnectorItem *from, ConnectorItem *to,
+										   const BreadboardRouteGraphCore::QueryContext &context) const
+		{
+			BreadboardRouteGraph::Result mapped;
+			const int fromIndex = indexForHole.value(from, -1);
+			const int toIndex = indexForHole.value(to, -1);
+			if (fromIndex < 0 || toIndex < 0)
+			{
+				mapped.reason = "endpoint is not a routable breadboard hole";
+				return mapped;
+			}
+			const BreadboardRouteGraphCore::Result result = core->route(fromIndex, toIndex, context);
+			mapped.found = result.found;
+			mapped.cost = result.cost;
+			mapped.score = result.score;
+			mapped.reason = result.reason;
+			Q_FOREACH (const BreadboardRouteGraphCore::Segment &segment, result.segments)
+			{
+				BreadboardRouteGraph::Segment mappedSegment;
+				mappedSegment.from = holes.at(segment.fromHole);
+				mappedSegment.to = holes.at(segment.toHole);
+				mappedSegment.cost = segment.cost;
+				mapped.segments.append(mappedSegment);
+			}
+			return mapped;
+		}
+	};
 
 	double leadCongestionPenalty(ConnectorItem *from, ConnectorItem *to, const QList<QLineF> &plannedSegments)
 	{
@@ -1629,6 +1728,8 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 	};
 
 	logAutoroute(QString("ratsnest demands: %1").arg(demands.count()));
+	const RouteGraphSession routeSession = RouteGraphSession::build(
+		routeHoles, [this](ConnectorItem *connectorItem) { return busGroupFor(connectorItem); });
 	Q_FOREACH (Wire *demand, demands)
 	{
 		const int createdBeforeDemand = created;
@@ -1651,8 +1752,8 @@ int BreadboardAutorouter::routeRatsnestDemands(QUndoCommand *parentCommand)
 
 		if (fromHole != nullptr && toHole != nullptr)
 		{
-			BreadboardRouteGraph graph(routeHoles, reservedHoles, routeGraphOptions(plannedSegments));
-			BreadboardRouteGraph::Result route = graph.route(fromHole, toHole);
+			const BreadboardRouteGraphCore::QueryContext routeContext = routeSession.prepare(reservedHoles, plannedSegments);
+			BreadboardRouteGraph::Result route = routeSession.route(fromHole, toHole, routeContext);
 			if (!route.found) {
 				failed++;
 				logAutoroute(QString("ratsnest demand failed: no board route from=[%1] to=[%2]")
@@ -1726,6 +1827,8 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 	const HoleBounds routeHoleBounds = boundsForHoles(routeHoles);
 	QList<QLineF> plannedSegments;
 	QSet<int> failedNetIndices;
+	const RouteGraphSession netRouteSession = RouteGraphSession::build(
+		routeHoles, [this](ConnectorItem *connectorItem) { return busGroupFor(connectorItem); });
 	const BreadboardRouteGraph::Options activeOptions = BreadboardRouteGraph::Options::fromEnvironment();
 	logAutoroute(QString("route options: maxJumperLength=%1 candidatesPerBusPair=%2 crossingPenalty=%3 overlapPenalty=%4")
 				 .arg(activeOptions.maxJumperLength)
@@ -1903,10 +2006,10 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				{
 					ConnectorItem *targetEntry = terminalEntries.at(targetIndex);
 					BreadboardRouteGraph::Result bestRoute;
-					BreadboardRouteGraph routeGraph(routeHoles, temporaryReserved, routeGraphOptions(entryPlanningSegments));
+					const BreadboardRouteGraphCore::QueryContext entryContext = netRouteSession.prepare(temporaryReserved, entryPlanningSegments);
 					Q_FOREACH (ConnectorItem *connectedEntry, connectedEntries)
 					{
-						BreadboardRouteGraph::Result route = routeGraph.route(connectedEntry, targetEntry);
+						BreadboardRouteGraph::Result route = netRouteSession.route(connectedEntry, targetEntry, entryContext);
 						if (!route.found)
 							continue;
 						if (routeIsBetter(route, bestRoute))
@@ -1982,7 +2085,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				BreadboardRouteGraph::Result bestRoute;
 				BreadboardRoutingScore bestBridgeScore;
 				bool haveBridgeScore = false;
-				BreadboardRouteGraph routeGraph(routeHoles, routeReservedHoles, routeGraphOptions(plannedSegments));
+				const BreadboardRouteGraphCore::QueryContext bridgeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments);
 
 				Q_FOREACH (ConnectorItem *entry, routeHoles)
 				{
@@ -1999,7 +2102,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 					{
 						if (anchor == nullptr)
 							continue;
-						BreadboardRouteGraph::Result route = routeGraph.route(entry, anchor);
+						BreadboardRouteGraph::Result route = netRouteSession.route(entry, anchor, bridgeContext);
 						if (!route.found)
 							continue;
 
@@ -2072,7 +2175,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 			BreadboardRoutingScore bestRoutingScore;
 			double bestTieBreak = std::numeric_limits<double>::max();
 			bool haveBestScore = false;
-			BreadboardRouteGraph routeGraph(routeHoles, routeReservedHoles, routeGraphOptions(plannedSegments));
+			const BreadboardRouteGraphCore::QueryContext mergeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments);
 
 			for (int fromSubnet = 0; fromSubnet < groups.count(); fromSubnet++)
 			{
@@ -2092,7 +2195,7 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 						{
 							if (fromCandidate == nullptr || toCandidate == nullptr || fromCandidate == toCandidate)
 								continue;
-							BreadboardRouteGraph::Result route = routeGraph.route(fromCandidate, toCandidate);
+							BreadboardRouteGraph::Result route = netRouteSession.route(fromCandidate, toCandidate, mergeContext);
 							if (!route.found)
 								continue;
 							const double tieBreak = routeScore(fromCandidate, toCandidate);
@@ -2117,8 +2220,8 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				logAutoroute(QString("route graph failed: net=%1 groups=%2 buses=%3 edges=%4")
 								 .arg(i)
 								 .arg(groups.count())
-								 .arg(routeGraph.busCount())
-								 .arg(routeGraph.edgeCount()));
+								 .arg(netRouteSession.core->busCount())
+								 .arg(netRouteSession.core->edgeCount()));
 				break;
 			}
 
