@@ -164,56 +164,43 @@ BreadboardRouteGraphCore::QueryContext BreadboardRouteGraphCore::prepareQuery(co
 	return context;
 }
 
-BreadboardRouteGraphCore::Result BreadboardRouteGraphCore::route(int startHole, int targetHole,
-																 const QueryContext & context) const
+BreadboardRouteGraphCore::MultiResult BreadboardRouteGraphCore::routeFrom(int sourceHole,
+																		  const QueryContext & context) const
 {
-	Result result;
-	if (startHole < 0 || startHole >= m_holeBus.count()
-		|| targetHole < 0 || targetHole >= m_holeBus.count())
-	{
-		result.reason = "endpoint out of range";
-		return result;
-	}
-	const int startBus = m_holeBus.at(startHole);
-	const int targetBus = m_holeBus.at(targetHole);
-	if (startBus < 0 || targetBus < 0)
-	{
-		result.reason = "endpoint has no breadboard bus";
-		return result;
-	}
-	if (startBus == targetBus)
-	{
-		result.found = true;
-		return result;
-	}
+	MultiResult multi;
+	if (sourceHole < 0 || sourceHole >= m_holeBus.count())
+		return multi;
+	const int sourceBus = m_holeBus.at(sourceHole);
+	if (sourceBus < 0)
+		return multi;
+
+	multi.sourceHole = sourceHole;
+	multi.sourceBus = sourceBus;
+	const int busCount = m_holesByBus.count();
+	multi.bestByBus = QVector<BreadboardRoutingScore>(busCount);
+	multi.reachedByBus = QVector<bool>(busCount, false);
+	multi.cameFromEdge = QVector<int>(busCount, -1);
+	multi.edgeQueryCost = QVector<double>(busCount, 0.0);
+	multi.reachedByBus[sourceBus] = true;
 
 	auto holeAvailable = [&](int hole) {
-		if (hole == startHole || hole == targetHole)
+		if (hole == sourceHole)
 			return true;
 		return hole >= 0 && hole < context.holeBlocked.count() ? !context.holeBlocked.at(hole) : true;
 	};
 
-	const int busCount = m_holesByBus.count();
-	QVector<BreadboardRoutingScore> best(busCount);
-	QVector<bool> reached(busCount, false);
 	QVector<bool> settled(busCount, false);
-	QVector<int> cameFrom(busCount, -1);   // edge index into m_edges
-	QVector<double> edgeQueryCost(busCount, 0.0);
-	reached[startBus] = true;
-
 	while (true)
 	{
 		int currentBus = -1;
 		for (int bus = 0; bus < busCount; bus++)
 		{
-			if (!reached.at(bus) || settled.at(bus))
+			if (!multi.reachedByBus.at(bus) || settled.at(bus))
 				continue;
-			if (currentBus < 0 || best.at(bus) < best.at(currentBus))
+			if (currentBus < 0 || multi.bestByBus.at(bus) < multi.bestByBus.at(currentBus))
 				currentBus = bus;
 		}
 		if (currentBus < 0)
-			break;
-		if (currentBus == targetBus)
 			break;
 		settled[currentBus] = true;
 
@@ -225,29 +212,57 @@ BreadboardRouteGraphCore::Result BreadboardRouteGraphCore::route(int startHole, 
 
 			const double congestion = context.edgeCongestion.value(edgeIndex, 0.0);
 
-			BreadboardRoutingScore nextScore = best.at(currentBus);
+			BreadboardRoutingScore nextScore = multi.bestByBus.at(currentBus);
 			nextScore.jumperCount++;
 			nextScore.jumperLength += edge.length;
 			nextScore.congestion += congestion;
-			if (reached.at(edge.toBus) && !(nextScore < best.at(edge.toBus)))
+			if (multi.reachedByBus.at(edge.toBus) && !(nextScore < multi.bestByBus.at(edge.toBus)))
 				continue;
-			best[edge.toBus] = nextScore;
-			reached[edge.toBus] = true;
-			cameFrom[edge.toBus] = edgeIndex;
-			edgeQueryCost[edge.toBus] = edge.length + m_options.jumperPenalty + congestion;
+			multi.bestByBus[edge.toBus] = nextScore;
+			multi.reachedByBus[edge.toBus] = true;
+			multi.cameFromEdge[edge.toBus] = edgeIndex;
+			multi.edgeQueryCost[edge.toBus] = edge.length + m_options.jumperPenalty + congestion;
+			settled[edge.toBus] = false;
 		}
 	}
+	return multi;
+}
 
-	if (cameFrom.at(targetBus) < 0)
+BreadboardRouteGraphCore::Result BreadboardRouteGraphCore::extractRoute(const MultiResult & multi,
+																		int targetHole) const
+{
+	Result result;
+	if (multi.sourceBus < 0)
 	{
-		result.reason = QString("no route bus%1 -> bus%2").arg(startBus).arg(targetBus);
+		result.reason = "invalid source";
+		return result;
+	}
+	if (targetHole < 0 || targetHole >= m_holeBus.count())
+	{
+		result.reason = "endpoint out of range";
+		return result;
+	}
+	const int targetBus = m_holeBus.at(targetHole);
+	if (targetBus < 0)
+	{
+		result.reason = "endpoint has no breadboard bus";
+		return result;
+	}
+	if (targetBus == multi.sourceBus)
+	{
+		result.found = true;
+		return result;
+	}
+	if (!multi.reachedByBus.at(targetBus) || multi.cameFromEdge.at(targetBus) < 0)
+	{
+		result.reason = QString("no route bus%1 -> bus%2").arg(multi.sourceBus).arg(targetBus);
 		return result;
 	}
 
 	int bus = targetBus;
-	while (bus != startBus)
+	while (bus != multi.sourceBus)
 	{
-		const int edgeIndex = cameFrom.at(bus);
+		const int edgeIndex = multi.cameFromEdge.at(bus);
 		if (edgeIndex < 0)
 		{
 			result.reason = QString("broken route backtrace at bus%1").arg(bus);
@@ -258,16 +273,42 @@ BreadboardRouteGraphCore::Result BreadboardRouteGraphCore::route(int startHole, 
 		Segment segment;
 		segment.fromHole = edge.fromHole;
 		segment.toHole = edge.toHole;
-		segment.cost = edgeQueryCost.at(bus);
+		segment.cost = multi.edgeQueryCost.at(bus);
 		result.segments.prepend(segment);
 		result.cost += segment.cost;
 		bus = edge.fromBus;
 	}
 
 	result.found = true;
-	result.score = best.at(targetBus);
+	result.score = multi.bestByBus.at(targetBus);
 	result.cost = result.score.jumperLength + result.score.congestion;
 	return result;
+}
+
+BreadboardRouteGraphCore::Result BreadboardRouteGraphCore::route(int startHole, int targetHole,
+																 const QueryContext & context) const
+{
+	Result result;
+	if (startHole < 0 || startHole >= m_holeBus.count()
+		|| targetHole < 0 || targetHole >= m_holeBus.count())
+	{
+		result.reason = "endpoint out of range";
+		return result;
+	}
+	if (m_holeBus.at(startHole) < 0 || m_holeBus.at(targetHole) < 0)
+	{
+		result.reason = "endpoint has no breadboard bus";
+		return result;
+	}
+
+	// Pairwise routing rides the single-source machinery with the target
+	// hole additionally exempted from blocking (matching original
+	// semantics where both endpoints were always usable).
+	QueryContext exempted = context;
+	if (targetHole < exempted.holeBlocked.count())
+		exempted.holeBlocked[targetHole] = false;
+	const MultiResult multi = routeFrom(startHole, exempted);
+	return extractRoute(multi, targetHole);
 }
 
 double BreadboardRouteGraphCore::congestionPenalty(const QLineF & candidate,

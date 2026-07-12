@@ -83,6 +83,22 @@ public:
 
 	Result route(int startHole, int targetHole, const QueryContext & context) const;
 
+	// Single-source variant: one Dijkstra from sourceHole settles every
+	// reachable bus; extractRoute then reads any target in O(path length).
+	// Turns entry x anchor scans (N x M Dijkstras) into M Dijkstras.
+	// Note: only the SOURCE hole is exempt from blocking; targets extracted
+	// later must be unblocked holes.
+	struct MultiResult {
+		int sourceHole = -1;
+		int sourceBus = -1;
+		QVector<BreadboardRoutingScore> bestByBus;
+		QVector<bool> reachedByBus;
+		QVector<int> cameFromEdge;
+		QVector<double> edgeQueryCost;
+	};
+	MultiResult routeFrom(int sourceHole, const QueryContext & context) const;
+	Result extractRoute(const MultiResult & multi, int targetHole) const;
+
 	int busCount() const { return m_holesByBus.count(); }
 	int edgeCount() const { return m_edges.count(); }
 

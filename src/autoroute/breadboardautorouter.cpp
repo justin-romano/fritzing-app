@@ -183,18 +183,9 @@ namespace
 			return core->prepareQuery(blocked, plannedSegments);
 		}
 
-		BreadboardRouteGraph::Result route(ConnectorItem *from, ConnectorItem *to,
-										   const BreadboardRouteGraphCore::QueryContext &context) const
+		BreadboardRouteGraph::Result mapResult(const BreadboardRouteGraphCore::Result &result) const
 		{
 			BreadboardRouteGraph::Result mapped;
-			const int fromIndex = indexForHole.value(from, -1);
-			const int toIndex = indexForHole.value(to, -1);
-			if (fromIndex < 0 || toIndex < 0)
-			{
-				mapped.reason = "endpoint is not a routable breadboard hole";
-				return mapped;
-			}
-			const BreadboardRouteGraphCore::Result result = core->route(fromIndex, toIndex, context);
 			mapped.found = result.found;
 			mapped.cost = result.cost;
 			mapped.score = result.score;
@@ -208,6 +199,43 @@ namespace
 				mapped.segments.append(mappedSegment);
 			}
 			return mapped;
+		}
+
+		BreadboardRouteGraph::Result route(ConnectorItem *from, ConnectorItem *to,
+										   const BreadboardRouteGraphCore::QueryContext &context) const
+		{
+			const int fromIndex = indexForHole.value(from, -1);
+			const int toIndex = indexForHole.value(to, -1);
+			if (fromIndex < 0 || toIndex < 0)
+			{
+				BreadboardRouteGraph::Result mapped;
+				mapped.reason = "endpoint is not a routable breadboard hole";
+				return mapped;
+			}
+			return mapResult(core->route(fromIndex, toIndex, context));
+		}
+
+		// One Dijkstra from `source` answers every later extract() in O(path).
+		BreadboardRouteGraphCore::MultiResult routeFrom(ConnectorItem *source,
+														const BreadboardRouteGraphCore::QueryContext &context) const
+		{
+			const int index = indexForHole.value(source, -1);
+			if (index < 0)
+				return BreadboardRouteGraphCore::MultiResult();
+			return core->routeFrom(index, context);
+		}
+
+		BreadboardRouteGraph::Result extract(const BreadboardRouteGraphCore::MultiResult &multi,
+											 ConnectorItem *target) const
+		{
+			const int index = indexForHole.value(target, -1);
+			if (index < 0)
+			{
+				BreadboardRouteGraph::Result mapped;
+				mapped.reason = "endpoint is not a routable breadboard hole";
+				return mapped;
+			}
+			return mapResult(core->extractRoute(multi, index));
 		}
 	};
 
@@ -2086,6 +2114,11 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 				BreadboardRoutingScore bestBridgeScore;
 				bool haveBridgeScore = false;
 				const BreadboardRouteGraphCore::QueryContext bridgeContext = netRouteSession.prepare(routeReservedHoles, plannedSegments);
+				// One Dijkstra per anchor; each of the ~holes entries below
+				// is then a constant-time extract instead of its own search.
+				QList<BreadboardRouteGraphCore::MultiResult> anchorRoutes;
+				Q_FOREACH (ConnectorItem *anchor, breadboardAnchors)
+					anchorRoutes.append(netRouteSession.routeFrom(anchor, bridgeContext));
 
 				Q_FOREACH (ConnectorItem *entry, routeHoles)
 				{
@@ -2098,11 +2131,12 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 					if (entryScore == std::numeric_limits<double>::max())
 						continue;
 
-					Q_FOREACH (ConnectorItem *anchor, breadboardAnchors)
+					for (int anchorIndex = 0; anchorIndex < breadboardAnchors.count(); anchorIndex++)
 					{
+						ConnectorItem *anchor = breadboardAnchors.at(anchorIndex);
 						if (anchor == nullptr)
 							continue;
-						BreadboardRouteGraph::Result route = netRouteSession.route(entry, anchor, bridgeContext);
+						BreadboardRouteGraph::Result route = netRouteSession.extract(anchorRoutes.at(anchorIndex), entry);
 						if (!route.found)
 							continue;
 
