@@ -219,3 +219,15 @@ Current top-level status includes:
 - untracked `experiments/`.
 
 Use `rg` for searches and `apply_patch` for manual edits. Keep changes scoped and build after C++ changes.
+
+## CRITICAL correctness bug (2026-07-12, user-caught): routing shorts foreign buses
+
+After autorouting stress.fzz the SCHEMATIC shows new ratsnest demands from the M5450's unused outputs (out 26/27/28...) to live nets: the router created connections that do not exist in the schematic - shorts. Mechanism: occupancy is checked per HOLE, not per BUS. Jumpers and routed hops may land in a column whose other holes host a foreign part pin; that pin joins the jumper's net. No-net pins (unused DIP outputs - still real outputs!) are skipped by the placement conflict guards entirely, making them bus-transparent.
+
+Fix (FIRST ITEM next session, outranks all speed work):
+1. Route graph QueryContext gains bus-level blocking: a bus is traversable/landable only if it hosts no part pins from other nets (prepare() needs the querying net's own connector set to exempt).
+2. Placement conflict guards treat ANY placed pin (netted or not) as claiming its bus against foreign nets.
+3. Boost test: synthetic board with a foreign pin mid-column - route must detour or fail, never land there; placement must not put a foreign-net pin on that bus.
+4. Verify on stress.fzz: schematic view shows ZERO new ratsnests after autoroute (this is the acceptance test - eyeball plus countUnresolvedNets-style scan of schematic-view ratsnest wires could automate it).
+
+Note: user's schematic file is not modified by routing; the dashes are live ratsnest overlays from the bad breadboard connections. Single Undo clears them.
