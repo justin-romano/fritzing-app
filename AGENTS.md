@@ -127,6 +127,8 @@ Stage 0 baselines (phase-summary lines, exe of 2026-07-12 15:17):
 - fuzz.fzz: clear=0 collect=0 placeSearch=525 placeExec=1 routeSearch=2279 routeExec=51 completion=0 total=2872ms, score 0 failed / 5 jumpers.
 - stress.fzz (F:\docs\Fritzing\stress.fzz, 2 boards ~1700 holes, 40-pin DIP + breakouts): placeSearch=50806 routeSearch=302402 routeExec=196 completion=489 total=353936ms, score 6 failedNets, placed only 19 parts (DIP placement suspected failing - Stage 1.5).
 
+ROOT CAUSE FOUND (routeSearch): BreadboardRouteGraph's constructor (breadboardroutegraph.cpp buildStaticEdges, line ~171) does all-bus-pairs x all-hole-pairs edge building (plus a congestion scan over plannedSegments per candidate edge), and the graph is RECONSTRUCTED per net and per entry-candidate inside routeCollectedNets/routeRatsnestDemands (graph ctor call sites ~1654, ~1906, ~1985). Fix: construct once per routing pass; keep reserved-hole filtering at query time (edgeAvailable already does); move congestion from construction-time edge cost to an additive query-time term; prune bus pairs spatially by maxJumperLength; int bus ids instead of QString keys. Log buffering and bus memoization are already in (placement search 470->125ms on fuzz; routeSearch unaffected at ~2.2s because of the above).
+
 KEY FINDING: routeSearch dominates (79%/85%) — routing SEARCH, not command execution (51/196ms). Stage 4 (routing) promoted onto the critical path; profile inside routeCollectedNets next (suspects: collectCandidateGroups O(n^2) bus pairing per net, routingCandidatesForSubnet re-walks). Unit tests: repo uses Boost.Test (tests/auto/test_breadboard_routing_score); new pure kernels land test-first, GUI smoke only for end-to-end acceptance.
 
 ## Unresolved Work
