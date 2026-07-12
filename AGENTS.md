@@ -233,3 +233,12 @@ Fix (FIRST ITEM next session, outranks all speed work):
 Note: user's schematic file is not modified by routing; the dashes are live ratsnest overlays from the bad breadboard connections. Single Undo clears them.
 
 Related (same root, user-observed): the second breadboard on stress.fzz goes entirely unused. Scoring only rewards clustering (net affinity + centre pull + jumper penalty), so board 1 absorbs everything - which is exactly the crowding that produced the bus collisions. The bus-claim fix will make dense single-board placement infeasible; pair it with per-board bounds (already planned) and a spill rule so candidates on an emptier board stop being penalized once the busy board's free-bus supply tightens. Acceptance on stress.fzz: zero schematic ratsnests AND parts distributed across both boards when board 1 cannot legally hold them.
+
+## PRIME INVARIANT (user-stated 2026-07-12)
+
+The router must never attempt any connection that breaks the schematic: the routed result's electrical connectivity must equal the schematic netlist exactly - no created connections, no destroyed ones. This supersedes every optimization goal.
+
+Enforcement is dual:
+1. By construction - bus ownership model: every bus is FREE or owned by exactly one net; placement candidates, jumper landings, and route hops may only use buses they own or can claim. Schematic-breaking states become unrepresentable in the search space.
+2. By audit - mandatory post-route schematic conformance check (analogous to verifyPlacedConnections): recompute part-pin connectivity after routing and assert the connected-pin partition equals the schematic net partition (unrouted nets may remain split and are reported as failures; NOTHING may be merged). On violation: end macro, undo, report details, never ship the result silently.
+3. Boost tests at the kernel level (foreign pin mid-column must force detour/failure) plus the audit as end-to-end acceptance on fuzz.fzz and stress.fzz.
