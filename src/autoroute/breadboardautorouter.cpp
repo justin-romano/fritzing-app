@@ -302,6 +302,19 @@ BreadboardAutorouter::BreadboardAutorouter(BreadboardSketchWidget *sketchWidget)
 {
 }
 
+QString BreadboardAutorouter::PhaseStats::toString() const
+{
+	return QString("clear=%1ms collect=%2ms placeSearch=%3ms placeExec=%4ms routeSearch=%5ms routeExec=%6ms completion=%7ms cleanup=%8ms")
+		.arg(clearMs)
+		.arg(collectMs)
+		.arg(placeSearchMs)
+		.arg(placeExecMs)
+		.arg(routeSearchMs)
+		.arg(routeExecMs)
+		.arg(completionMs)
+		.arg(cleanupMs);
+}
+
 BreadboardAutorouter::~BreadboardAutorouter()
 {
 	clearCollectedNets();
@@ -315,6 +328,14 @@ void BreadboardAutorouter::start()
 	elapsed.start();
 	m_componentLeadLength = 0.0;
 	m_lastRoutingScore = BreadboardRoutingScore();
+	m_phaseStats = PhaseStats();
+	QElapsedTimer phaseTimer;
+	phaseTimer.start();
+	auto takePhaseMs = [&phaseTimer]() {
+		const qint64 ms = phaseTimer.elapsed();
+		phaseTimer.restart();
+		return ms;
+	};
 
 	QFile::remove(logFilePath());
 	logAutoroute("========== breadboard autoroute start ==========");
@@ -335,7 +356,9 @@ void BreadboardAutorouter::start()
 				 .arg(undoIndexBefore));
 	undoStack->beginMacro(QObject::tr("Breadboard autoroute"));
 
+	phaseTimer.restart();
 	const int cleared = clearPreviousAutorouteWires();
+	m_phaseStats.clearMs = takePhaseMs();
 	if (cleared > 0)
 	{
 		logAutoroute(QString("clear complete: removedWires=%1").arg(cleared));
@@ -347,6 +370,7 @@ void BreadboardAutorouter::start()
 
 	QHash<ConnectorItem *, int> indexer;
 	m_sketchWidget->collectAllNets(indexer, m_allPartConnectorItems, false, false, false);
+	m_phaseStats.collectMs = takePhaseMs();
 	logAutoroute(QString("collectAllNets: nets=%1 indexer=%2").arg(m_allPartConnectorItems.count()).arg(indexer.count()));
 
 	if (m_allPartConnectorItems.isEmpty())
@@ -362,7 +386,10 @@ void BreadboardAutorouter::start()
 	Q_EMIT setProgressMessage(QObject::tr("Placing breadboard parts..."));
 	Q_EMIT setProgressMessage2(QString());
 
+	phaseTimer.restart();
 	int placed = autoplacePartsOnBreadboard();
+	// placeExecMs is recorded inside autoplace around its command push.
+	m_phaseStats.placeSearchMs = takePhaseMs() - m_phaseStats.placeExecMs;
 	logAutoroute(QString("undo transaction after placement: count=%1 index=%2")
 				 .arg(undoStack->count())
 				 .arg(undoStack->index()));
@@ -393,7 +420,9 @@ void BreadboardAutorouter::start()
 
 	auto *parentCommand = new QUndoCommand(QObject::tr("Route breadboard jumpers"));
 
+	phaseTimer.restart();
 	int created = routeCollectedNets(parentCommand);
+	m_phaseStats.routeSearchMs = takePhaseMs();
 	logAutoroute(QString("route complete: createdWires=%1").arg(created));
 
 	Q_EMIT setProgressValue(m_allPartConnectorItems.count());
@@ -422,7 +451,9 @@ void BreadboardAutorouter::start()
 
 	new CleanUpRatsnestsCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, parentCommand);
 	new CleanUpWiresCommand(m_sketchWidget, CleanUpWiresCommand::RedoOnly, parentCommand);
+	phaseTimer.restart();
 	undoStack->push(parentCommand);
+	m_phaseStats.routeExecMs = takePhaseMs();
 
 	// The net-level planner minimizes jumpers, but Fritzing's ratsnest model is
 	// the authoritative completion check. Route only demands that remain after
@@ -449,15 +480,21 @@ void BreadboardAutorouter::start()
 					 .arg(completed)
 					 .arg(residualRatsnests));
 	}
+	m_phaseStats.completionMs = takePhaseMs();
 	logAutoroute(QString("undo transaction after routing: count=%1 index=%2")
 				 .arg(undoStack->count())
 				 .arg(undoStack->index()));
 	undoStack->endMacro();
+	m_phaseStats.cleanupMs = takePhaseMs();
 	logAutoroute(QString("undo transaction end: count=%1 index=%2 delta=%3")
 				 .arg(undoStack->count())
 				 .arg(undoStack->index())
 				 .arg(undoStack->count() - undoCountBefore));
 	m_lastRoutingScore.failedNets = residualRatsnests;
+	logAutoroute(QString("phase-summary: %1 total=%2ms score={%3}")
+				 .arg(m_phaseStats.toString())
+				 .arg(elapsed.elapsed())
+				 .arg(m_lastRoutingScore.toString()));
 	logAutoroute(QString("benchmark: %1 elapsedMs=%2")
 				 .arg(m_lastRoutingScore.toString())
 				 .arg(elapsed.elapsed()));
@@ -1450,7 +1487,10 @@ int BreadboardAutorouter::autoplacePartsOnBreadboard()
 		return 0;
 	}
 
+	QElapsedTimer execTimer;
+	execTimer.start();
 	m_sketchWidget->undoStack()->push(parentCommand);
+	m_phaseStats.placeExecMs = execTimer.elapsed();
 	QStringList connectionFailures;
 	if (!verifyPlacedConnections(newlyPlacedTargets, connectionFailures))
 	{
@@ -1687,20 +1727,29 @@ int BreadboardAutorouter::routeCollectedNets(QUndoCommand *parentCommand)
 	{
 		routeOrder.append(netIndex);
 	}
-	std::sort(routeOrder.begin(), routeOrder.end(), [this](int firstIndex, int secondIndex) {
-		auto difficulty = [this](QList<ConnectorItem *> *net) {
-			if (net == nullptr) return 0.0;
-			const QList<ConnectorItem *> candidates = routingCandidatesForSubnet(*net);
-			const int groups = collectCandidateGroups(candidates).count();
-			QRectF bounds;
-			Q_FOREACH (ConnectorItem *candidate, candidates) {
-				if (candidate == nullptr) continue;
-				const QRectF point(candidate->sceneAdjustedTerminalPoint(nullptr), QSizeF(1.0, 1.0));
-				bounds = bounds.isNull() ? point : bounds | point;
-			}
-			return groups * 100000.0 + candidates.count() * 1000.0 + bounds.width() + bounds.height();
-		};
-		return difficulty(m_allPartConnectorItems.value(firstIndex)) > difficulty(m_allPartConnectorItems.value(secondIndex));
+	// Precompute each net's difficulty once: the sort comparator would
+	// otherwise re-run subnet grouping O(n log n) times.
+	QHash<int, double> difficultyForNet;
+	Q_FOREACH (int netIndex, routeOrder)
+	{
+		QList<ConnectorItem *> *net = m_allPartConnectorItems.value(netIndex);
+		if (net == nullptr)
+		{
+			difficultyForNet.insert(netIndex, 0.0);
+			continue;
+		}
+		const QList<ConnectorItem *> candidates = routingCandidatesForSubnet(*net);
+		const int groups = collectCandidateGroups(candidates).count();
+		QRectF bounds;
+		Q_FOREACH (ConnectorItem *candidate, candidates) {
+			if (candidate == nullptr) continue;
+			const QRectF point(candidate->sceneAdjustedTerminalPoint(nullptr), QSizeF(1.0, 1.0));
+			bounds = bounds.isNull() ? point : bounds | point;
+		}
+		difficultyForNet.insert(netIndex, groups * 100000.0 + candidates.count() * 1000.0 + bounds.width() + bounds.height());
+	}
+	std::sort(routeOrder.begin(), routeOrder.end(), [&difficultyForNet](int firstIndex, int secondIndex) {
+		return difficultyForNet.value(firstIndex) > difficultyForNet.value(secondIndex);
 	});
 	QStringList routeOrderText;
 	Q_FOREACH (int netIndex, routeOrder) routeOrderText.append(QString::number(netIndex));

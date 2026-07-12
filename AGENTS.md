@@ -118,6 +118,17 @@ Also learned: leg polygons are straight but the rendered lead includes the part 
 - OPEN BUG found via bigmuff: sketches whose connectivity exists only as schematic-view wires get NO breadboard ratsnest wires on load ("No connections to route" in the status bar). Placement works (collectAllNets sees the nets) but routeCollectedNets/countUnresolvedNets rely on the ratsnest model, so peripheral wiring is skipped entirely (wiredPeripheral=0, totalWires=0) and the run reports success. Either force a ratsnest rebuild before routing, or derive routing demands from collectAllNets instead of ratsnests.
 - GUI harness gotcha: a fresh Fritzing restores the last-active view; Ctrl+Shift+A dispatches per current view (PCB tab -> maze router!). Always send Ctrl+1 (breadboard) before Ctrl+Shift+A in automation.
 
+## Parallelization program (started 2026-07-12)
+
+Plan: C:\Users\Administrator\.claude\plans\now-im-going-full-pure-lemur.md (approved). Committed through Stage 0 instrumentation.
+
+Stage 0 baselines (phase-summary lines, exe of 2026-07-12 15:17):
+
+- fuzz.fzz: clear=0 collect=0 placeSearch=525 placeExec=1 routeSearch=2279 routeExec=51 completion=0 total=2872ms, score 0 failed / 5 jumpers.
+- stress.fzz (F:\docs\Fritzing\stress.fzz, 2 boards ~1700 holes, 40-pin DIP + breakouts): placeSearch=50806 routeSearch=302402 routeExec=196 completion=489 total=353936ms, score 6 failedNets, placed only 19 parts (DIP placement suspected failing - Stage 1.5).
+
+KEY FINDING: routeSearch dominates (79%/85%) — routing SEARCH, not command execution (51/196ms). Stage 4 (routing) promoted onto the critical path; profile inside routeCollectedNets next (suspects: collectCandidateGroups O(n^2) bus pairing per net, routingCandidatesForSubnet re-walks). Unit tests: repo uses Boost.Test (tests/auto/test_breadboard_routing_score); new pure kernels land test-first, GUI smoke only for end-to-end acceptance.
+
 ## Unresolved Work
 
 1. Reduce board jumpers without breaking connectivity. Optimize in strict priority order:

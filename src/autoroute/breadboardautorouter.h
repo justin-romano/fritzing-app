@@ -80,6 +80,22 @@ private:
 	void clearCollectedNets();
 	void loadTuning();
 
+	// Wall-clock per pipeline phase, reset each start(); logged as one
+	// greppable phase-summary line so critical paths are comparable per
+	// sketch and across builds.
+	struct PhaseStats
+	{
+		qint64 clearMs = 0;
+		qint64 collectMs = 0;
+		qint64 placeSearchMs = 0;
+		qint64 placeExecMs = 0;
+		qint64 routeSearchMs = 0;
+		qint64 routeExecMs = 0;
+		qint64 completionMs = 0;
+		qint64 cleanupMs = 0;
+		QString toString() const;
+	};
+
 private:
 	BreadboardSketchWidget * m_sketchWidget = nullptr;
 	QList< QList<ConnectorItem *> * > m_allPartConnectorItems;
@@ -89,6 +105,7 @@ private:
 
 	// Placement tuning weights, read from QSettings at every start() so the
 	// toolbar sliders take effect without restarting. Defaults live here.
+	PhaseStats m_phaseStats;
 	double m_maxLegLength = 120.0;
 	double m_leadLengthWeight = 1.0;
 	double m_jumperPenalty = 100000.0;
